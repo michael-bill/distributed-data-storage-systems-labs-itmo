@@ -66,6 +66,8 @@ No. Имя столбца 		Атрибуты
 
 Реализованный скрипт вывода информации по таблице: [script.sql](./script.sql)
 
+Если ссылка не сработала, то глобальная: [script.sql](https://github.com/michael-bill/distributed-data-storage-systems-labs-itmo/blob/main/lab1/script.sql)
+
 Сценарии и примеры использования:
 
 Поиск через search path
