@@ -77,19 +77,19 @@ No. Имя столбца 		Атрибуты
 Поиск через search path
 
 ```
-psql -U s367101 -d studs -v table_name=users -f 1.sql
+psql -U s367101 -d studs -v table_name=users -f script.sql
 ```
 
 Или (schema.table_name):
 
 ```
-psql -U s367101 -d studs -v table_name=s367101.users -f 1.sql
+psql -U s367101 -d studs -v table_name=s367101.users -f script.sql
 ```
 
 Или (database.schema.table_name):
 
 ```
-psql -U s367101 -d studs -v table_name=studs.s367101.users -f 1.sql
+psql -U s367101 -d studs -v table_name=studs.s367101.users -f script.sql
 ```
 
 Получаем примерно вот такой вывод:
