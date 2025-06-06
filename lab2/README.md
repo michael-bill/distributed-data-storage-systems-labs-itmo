@@ -401,18 +401,6 @@ initdb -D $HOME/onb52 \
         pg_catalog.pg_tablespace ts
     order by
         ts.spcname;
-
-    -- Базы данных и их табличные пространства по умолчанию:
-    select
-        d.datname as "имя базы данных",
-        coalesce(t.spcname, '(кластерное по умолчанию)') as "табличное пространство по умолчанию"
-    from
-        pg_catalog.pg_database d
-        left join pg_catalog.pg_tablespace t on d.dattablespace = t.oid
-    where d.datistemplate = false -- Исключаем шаблоны баз данных
-    order by
-        d.datname;
-
     \q
     ```
 
@@ -423,6 +411,7 @@ initdb -D $HOME/onb52 \
 
     Выполняем запрос:
     ```sql
+    -- Список всех табличных пространств и объектов внутри них
     select
         spc.spcname as "табличное пространство",
         string_agg(distinct obj.object_name, ', ' order by obj.object_name) as "объекты в табличном пространстве (в текущей БД)"
