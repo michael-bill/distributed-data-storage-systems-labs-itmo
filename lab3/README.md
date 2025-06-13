@@ -564,7 +564,7 @@ total 4795
     ожидание завершения работы сервера.... готово
     сервер остановлен
     ```
-*   Убираем старый каталог данных и создаем новый с правильными правами доступа.
+*   Убираем старый каталог данных и создаем новый.
 
     ```bash
     [postgres0@pg120 ~]$ mv $HOME/onb52 $HOME/onb52_crashed
@@ -583,7 +583,7 @@ total 4795
     [postgres0@pg120 ~]$ touch $HOME/onb52/recovery.signal
     [postgres0@pg120 ~]$ cat >> $HOME/onb52/postgresql.conf <<EOF
     restore_command = 'scp postgres4@pg112:/var/db/postgres4/wal_archive/%f %p'
-    recovery_target_time = '2025-06-13 13:56:16.901815+03'
+    recovery_target_time = '2025-06-13 14:54:51.189919+03'
     recovery_target_action = 'promote'
     EOF
     ```
