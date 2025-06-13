@@ -401,7 +401,6 @@ initdb -D $HOME/onb52 \
         pg_catalog.pg_tablespace ts
     order by
         ts.spcname;
-    \q
     ```
 
     Теперь подключаемся к базе `loudblackuser`, чтобы посмотреть объекты внутри неё:
@@ -444,12 +443,8 @@ initdb -D $HOME/onb52 \
                     where cl.relkind in ('r', 'i', 'S', 'm', 't')
                 ) obj_details
             join pg_catalog.pg_tablespace obj_ts on obj_ts.oid = obj_details.final_physical_oid -- Имя ТП объекта (нужно для фильтрации по имени ТП)
-            where (obj_ts.spcname = 'pg_global' and obj_details.object_schema_name = 'pg_catalog') -- Для pg_global только схема pg_catalog
-                or (obj_ts.spcname <> 'pg_global' and obj_details.object_schema_name not in ('pg_toast', 'pg_catalog', 'information_schema')) -- Для остальных ТП исключаем системные схемы
         ) obj on spc.oid = obj.final_physical_oid -- Соединяем ТП с отфильтрованными объектами
     group by spc.oid, spc.spcname
     order by spc.spcname;
-
-    \q
     ```
 ---
