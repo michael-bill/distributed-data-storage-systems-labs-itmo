@@ -83,8 +83,6 @@
     ```bash
     # ~/cold_backup.sh
 
-    #!/bin/bash
-
     # --- Переменные ---
     # Список всех директорий, составляющих кластер
     CLUSTER_DIRS_TO_BACKUP=("$HOME/onb52" "$HOME/nwx49" "$HOME/syi73" "$HOME/poe29" "$HOME/pgdata_custom_ts")
@@ -213,8 +211,6 @@ drwx------   3 postgres4 postgres  3 18 мая   14:37 syi73
 
     ```bash
     # ~/restore_last_backup.sh
-
-    #!/bin/bash
 
     set -e
 
@@ -405,16 +401,40 @@ loudblackuser=#
     [postgres0@pg120 ~]$ for dir in onb52 nwx49 syi73 poe29 pgdata_custom_ts; do mkdir $HOME/${dir}_restored; done
     
     # Копируем данные с резервного узла
-    [postgres0@pg120 ~]$ LATEST_BACKUP_PATH=$(ssh postgres4@pg112 'ls -td /var/db/postgres4/cold_backups/backup-* | head -n 1')
+    [postgres0@pg120 ~]$ LATEST_BACKUP_PATH="/var/db/postgres4/cold_backups/нужный бекап"
     [postgres0@pg120 ~]$ for dir in onb52 nwx49 syi73 poe29 pgdata_custom_ts; do
         rsync -a postgres4@pg112:$LATEST_BACKUP_PATH/$dir/ $HOME/${dir}_restored/
     done
 
-    # Корректируем ссылки
-    [postgres0@pg120 ~]$ PGDATA_RESTORED=$HOME/onb52_restored
+    # Определяем пути для удобства
+    [postgres0@pg120 ~]$ PGDATA_RESTORED="$HOME/onb52_restored"
+    [postgres0@pg120 ~]$ TBLSPC_DIR_RESTORED="$PGDATA_RESTORED/pg_tblspc"
+
+    # 1. Корректируем ссылку на WAL-каталог
     [postgres0@pg120 ~]$ rm $PGDATA_RESTORED/pg_wal
     [postgres0@pg120 ~]$ ln -s $HOME/nwx49_restored $PGDATA_RESTORED/pg_wal
-    # ... и так далее для всех табличных пространств ...
+
+    # 2. Корректируем ссылки на табличные пространства
+    # Узнаем OID и целевые директории из восстановленных "битых" ссылок
+    declare -A TBLSPC_LINKS
+    for link_path in "$PGDATA_RESTORED/pg_tblspc"/*; do
+        if [ -L "$link_path" ]; then
+            oid=$(basename "$link_path")
+            # Извлекаем базовое имя целевой директории (без суффикса)
+            target_dir_name=$(basename "$(readlink "$link_path")")
+            TBLSPC_LINKS[$oid]=$target_dir_name
+        fi
+    done
+
+    # Удаляем старые, некорректные ссылки
+    [postgres0@pg120 ~]$ find "$TBLSPC_DIR_RESTORED" -type l -delete
+
+    # Создаем новые, правильные ссылки на директории с суффиксом _restored
+    for oid in "${!TBLSPC_LINKS[@]}"; do
+        target_dir_name=${TBLSPC_LINKS[$oid]}
+        ln -s "$HOME/${target_dir_name}_restored" "$TBLSPC_DIR_RESTORED/$oid"
+        echo "Link for tablespace OID $oid -> ${target_dir_name}_restored recreated."
+    done
 
     # Запускаем сервер
     [postgres0@pg120 ~]$ pg_ctl -D $PGDATA_RESTORED start
