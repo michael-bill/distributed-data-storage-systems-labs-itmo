@@ -268,8 +268,7 @@ drwx------   3 postgres4 postgres  3 18 мая   14:37 syi73
 
     # 4. Коррекция символических ссылок
     echo "Correcting symbolic links..."
-    # (этот блок остается без изменений)
-    rm "$PGDATA_PATH/pg_wal"
+    rm -rf "$PGDATA_PATH/pg_wal"
     ln -s "$HOME/nwx49" "$PGDATA_PATH/pg_wal"
     echo "Link for pg_wal recreated."
 
@@ -415,12 +414,10 @@ loudblackuser=#
     [postgres0@pg120 ~]$ ln -s $HOME/nwx49_restored $PGDATA_RESTORED/pg_wal
 
     # 2. Корректируем ссылки на табличные пространства
-    # Узнаем OID и целевые директории из восстановленных "битых" ссылок
     declare -A TBLSPC_LINKS
     for link_path in "$PGDATA_RESTORED/pg_tblspc"/*; do
         if [ -L "$link_path" ]; then
             oid=$(basename "$link_path")
-            # Извлекаем базовое имя целевой директории (без суффикса)
             target_dir_name=$(basename "$(readlink "$link_path")")
             TBLSPC_LINKS[$oid]=$target_dir_name
         fi
@@ -582,10 +579,10 @@ total 4795
     ```bash
     [postgres0@pg120 ~]$ touch $HOME/onb52/recovery.signal
     [postgres0@pg120 ~]$ cat >> $HOME/onb52/postgresql.conf <<EOF
-    restore_command = 'scp postgres4@pg112:/var/db/postgres4/wal_archive/%f %p'
-    recovery_target_time = '2025-06-13 14:54:51.189919+03'
-    recovery_target_action = 'promote'
-    EOF
+restore_command = 'scp postgres4@pg112:/var/db/postgres4/wal_archive/%f %p'
+recovery_target_time = '2025-06-13 15:44:10.99056+03'
+recovery_target_action = 'promote'
+EOF
     ```
 *   Запускаем сервер. Он автоматически войдет в режим восстановления.
 
@@ -614,6 +611,7 @@ total 4795
 Протокол выполнения:
 
 ```bash
+[postgres0@pg120 ~]$ ssh postgres4@pg112 'mkdir -p /var/db/postgres4/wal_archive'
 [postgres0@pg120 ~]$ echo "wal_level = replica" >> $HOME/onb52/postgresql.conf
 [postgres0@pg120 ~]$ echo "archive_mode = on" >> $HOME/onb52/postgresql.conf
 [postgres0@pg120 ~]$ echo "archive_command = 'scp %p postgres4@pg112:/var/db/postgres4/wal_archive/%f'" >> $HOME/onb52/postgresql.conf
@@ -669,7 +667,7 @@ total 4795
 [postgres0@pg120 ~]$ touch $HOME/onb52/recovery.signal
 [postgres0@pg120 ~]$ cat >> $HOME/onb52/postgresql.conf <<EOF
 > restore_command = 'scp postgres4@pg112:/var/db/postgres4/wal_archive/%f %p'
-recovery_target_time = '2025-06-13 13:56:16.901815+03'
+recovery_target_time = '2025-06-13 15:56:21.414515+03'
 recovery_target_action = 'promote'
 EOF
 [postgres0@pg120 ~]$ pg_ctl -D $HOME/onb52 start
