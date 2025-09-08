@@ -139,6 +139,15 @@
     echo "--- Backup finished at $(date) ---"
     ```
 
+    Примечание: для исключения редких несогласованностей между `pg_control` и `pg_wal` рекомендуется использовать единый tar‑поток вместо нескольких `rsync` вызовов. Это даёт консистентный срез директорий за одну операцию передачи:
+
+    ```bash
+    # Рекомендуемый вариант копирования единым tar-потоком
+    [postgres0@pg120 ~]$ ssh postgres4@pg112 "mkdir -p /var/db/postgres4/cold_backups/$BACKUP_SUBDIR"
+    [postgres0@pg120 ~]$ tar -C "$HOME" -cf - onb52 nwx49 syi73 poe29 pgdata_custom_ts \
+      | ssh postgres4@pg112 "tar -C /var/db/postgres4/cold_backups/$BACKUP_SUBDIR -xf -"
+    ```
+
 3.  Дадим скрипту права на выполнение и настроим `cron` для ежедневного запуска.
 
     ```bash
@@ -456,6 +465,8 @@ pg_ctl: сервер работает (PID: 21345)
 
 ---
 
+------------
+
 ### **Этап 4. Логическое повреждение данных**
 
 #### **Задание**
@@ -496,7 +507,7 @@ pg_ctl: сервер работает (PID: 21345)
 Восстановление PITR требует наличия базовой копии, на которую будут "накатываться" WAL-файлы. Создаем ее с помощью `pg_basebackup`.
 
 ```bash
-[postgres0@pg120 ~]$ pg_basebackup -D $HOME/pitr_base_backup -Ft -Xs -P --wal-method=stream -p 9523
+[postgres0@pg120 ~]$ pg_basebackup -D $HOME/pitr_base_backup -Ft -X none -P -p 9523
 31689/31689 КБ (100%), табличное пространство 4/4
 ```
 
@@ -509,16 +520,16 @@ pg_ctl: сервер работает (PID: 21345)
 psql (16.4)
 Введите "help", чтобы получить справку.
 
-loudblackuser=# INSERT INTO users (username) VALUES ('user_to_be_restored');
+loudblackuser=# INSERT INTO users (username) VALUES ('user_to_be_restored_1');
 INSERT 0 1
-loudblackuser=# INSERT INTO chats (chat_name) VALUES ('chat_to_restore');
+loudblackuser=# INSERT INTO chats (chat_name) VALUES ('chat_to_restore_1');
 INSERT 0 1
 
 -- Фиксируем точное время ДО ошибки. Это наша точка восстановления.
 loudblackuser=# SELECT now();
               now              
 -------------------------------
- 2025-06-13 13:56:16.901815+03
+ 2025-09-08 03:57:38.590612+03
 (1 строка)
 
 -- Симулируем ошибку, удаляя важные таблицы
@@ -531,7 +542,7 @@ loudblackuser=# \q
 
 **4. Гарантированная доставка WAL-файлов в архив**
 
-Перед остановкой сервера принудительно переключаем WAL-сегмент, чтобы все последние изменения были отправлены в архив.
+Перед остановкой сервера принудительно переключаем WAL-сегмент дважды, чтобы все последние изменения гарантированно ушли в архив.
 
 ```bash
 [postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser -c "SELECT pg_switch_wal();"
@@ -540,13 +551,13 @@ loudblackuser=# \q
  0/3018AF8
 (1 строка)
 
+[postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser -c "SELECT pg_switch_wal();"
+ pg_switch_wal 
+---------------
+ 0/3020000
+(1 строка)
+
 [postgres0@pg120 ~]$ ssh postgres4@pg112 'ls -l /var/db/postgres4/wal_archive'
-total 4795
--rw-------  1 postgres4 postgres 16777216 13 июня  13:55 000000010000000000000001
--rw-------  1 postgres4 postgres 16777216 13 июня  13:55 000000010000000000000002
--rw-------  1 postgres4 postgres      338 13 июня  13:55 000000010000000000000002.00000028.backup
--rw-------  1 postgres4 postgres 16777216 13 июня  13:56 000000010000000000000003
--rw-------  1 postgres4 postgres 16777216 13 июня  13:48 000000010000000000000004
 ```
 **Анализ:** Проверка показала, что WAL-файлы успешно архивируются на резервном узле.
 
@@ -572,7 +583,42 @@ total 4795
 
     ```bash
     [postgres0@pg120 ~]$ tar -xf $HOME/pitr_base_backup/base.tar -C $HOME/onb52
-    [postgres0@pg120 ~]$ tar -xf $HOME/pitr_base_backup/pg_wal.tar -C $HOME/onb52/pg_wal
+    ```
+
+*   Восстанавливаем символические ссылки для tablespaces на основе tablespace_map:
+    ```bash
+    # Создаем символические ссылки на основе файла tablespace_map
+    [postgres0@pg120 ~]$ while read oid path; do
+        ln -s "$path" "$HOME/onb52/pg_tblspc/$oid"
+    done < "$HOME/onb52/tablespace_map"
+
+    # Альтернативный вариант - создание ссылок вручную (если известны OID):
+    # ln -s $HOME/syi73 $HOME/onb52/pg_tblspc/16388
+    # ln -s $HOME/poe29 $HOME/onb52/pg_tblspc/16389
+    # ln -s $HOME/pgdata_custom_ts $HOME/onb52/pg_tblspc/16390
+    ```
+
+*   Распаковываем тар‑архивы таблспейсов:
+
+    ```bash
+    [postgres0@pg120 ~]$ for l in "$HOME/onb52/pg_tblspc"/*; do
+        if [ -L "$l" ]; then  # Проверяем, что это символическая ссылка
+            oid=$(basename "$l")
+            dest=$(readlink -f "$l")
+            tf="$HOME/pitr_base_backup/$oid.tar"
+            
+            if [ -f "$tf" ]; then
+                echo "Restoring tablespace $oid into $dest"
+                # Очищаем и создаём директорию
+                rm -rf "$dest"
+                mkdir -p "$dest"
+                # Извлекаем архив
+                tar -xf "$tf" -C "$dest"
+                # Устанавливаем правильные права
+                chmod 700 "$dest"
+            fi
+        fi
+    done
     ```
 *   Создаем конфигурацию для восстановления, указывая точное время, зафиксированное ранее.
 
@@ -580,7 +626,7 @@ total 4795
     [postgres0@pg120 ~]$ touch $HOME/onb52/recovery.signal
     [postgres0@pg120 ~]$ cat >> $HOME/onb52/postgresql.conf <<EOF
 restore_command = 'scp postgres4@pg112:/var/db/postgres4/wal_archive/%f %p'
-recovery_target_time = '2025-06-13 15:44:10.99056+03'
+recovery_target_time = '2025-09-08 04:15:08.978111+03'
 recovery_target_action = 'promote'
 EOF
     ```
@@ -594,96 +640,197 @@ EOF
 *   Проверяем результат.
 
     ```bash
-    [postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser -c "\dt"
-                       Список отношений
-     Схема  |        Имя        |   Тип   |   Владелец    
-    --------+-------------------+---------+---------------
-     public | chat_participants | таблица | chat_app_user
-     public | chats             | таблица | chat_app_user
-     public | messages          | таблица | chat_app_user
-     public | users             | таблица | chat_app_user
-    (4 строки)
+    [postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser
     ```
 
-**Результат:** Все четыре таблицы, включая удаленные `messages` и `chat_participants`, снова на месте. Данные, добавленные перед `DROP TABLE`, также восстановлены. Это демонстрирует успешное восстановление состояния базы данных на заданный момент времени до совершения логической ошибки.
+#### Протокол выполнения
 
+    ```
+    [postgres0@pg120 ~]$ rm -rf onb52_crashed pitr_base_backup && ./rollback_primary_node.sh && pg_ctl -D onb52 stop
+    --- Starting rollback process for the primary node ---
+    PostgreSQL server is running. Stopping it...
+    ожидание завершения работы сервера.... готово
+    сервер остановлен
+    Server stopped.
+    Finding the latest backup on pg112...
+    Found latest backup on remote host: /var/db/postgres4/cold_backups/backup-2025-09-08_03-03-11
+    Cleaning up local cluster directories...
+    Restoring cluster structure from remote backup using rsync...
+    Restoring onb52...
+    Restoring nwx49...
+    Restoring syi73...
+    Restoring poe29...
+    Restoring pgdata_custom_ts...
+    All components restored.
+    Correcting symbolic links for local environment...
+    Link for pg_wal recreated for local user.
+    Link for tablespace OID 16389 -> poe29 recreated for local user.
+    Link for tablespace OID 16388 -> syi73 recreated for local user.
+    Link for tablespace OID 16390 -> pgdata_custom_ts recreated for local user.
+    All links have been corrected.
+    Starting the rolled-back PostgreSQL server...
+    ожидание запуска сервера.... готово
+    сервер запущен
+    pg_ctl: сервер работает (PID: 11956)
+    /usr/local/bin/postgres "-D" "/var/db/postgres0/onb52"
+    --- Rollback process for the primary node finished successfully ---
+    ожидание завершения работы сервера.... готово
+    сервер остановлен
+    [postgres0@pg120 ~]$ pg_ctl -D $HOME/onb52 restart
+    pg_ctl: файл PID "/var/db/postgres0/onb52/postmaster.pid" не существует
+    Запущен ли сервер?
+    производится попытка запуска сервера в любом случае
+    ожидание запуска сервера....2025-09-08 04:14:38.916 MSK [12081] @ [] СООБЩЕНИЕ:  передача вывода в протокол процессу сбора протоколов
+    2025-09-08 04:14:38.916 MSK [12081] @ [] ПОДСКАЗКА:  В дальнейшем протоколы будут выводиться в каталог "log".
+    готово
+    сервер запущен
+    [postgres0@pg120 ~]$ pg_basebackup -D $HOME/pitr_base_backup -Ft -X none -P -p 9523
+    ЗАМЕЧАНИЕ:  все нужные сегменты WAL заархивированы4
+    203677/203677 КБ (100%), табличное пространство 4/4
+    [postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser
+    psql (16.4)
+    Введите "help", чтобы получить справку.
 
-Протокол выполнения:
+    loudblackuser=#     select * from users;
+        select * from chats;
+        select * from chat_participants;
+        select * from messages;
+    user_id | username |          created_at           
+    ---------+----------+-------------------------------
+        1 | alice    | 2025-09-08 03:02:35.336203+03
+        2 | bob      | 2025-09-08 03:02:35.336203+03
+        3 | charlie  | 2025-09-08 03:02:35.336203+03
+    (3 строки)
 
-```bash
-[postgres0@pg120 ~]$ ssh postgres4@pg112 'mkdir -p /var/db/postgres4/wal_archive'
-[postgres0@pg120 ~]$ echo "wal_level = replica" >> $HOME/onb52/postgresql.conf
-[postgres0@pg120 ~]$ echo "archive_mode = on" >> $HOME/onb52/postgresql.conf
-[postgres0@pg120 ~]$ echo "archive_command = 'scp %p postgres4@pg112:/var/db/postgres4/wal_archive/%f'" >> $HOME/onb52/postgresql.conf
-[postgres0@pg120 ~]$ pg_ctl -D $HOME/onb52 restart
-ожидание завершения работы сервера.... готово
-сервер остановлен
-ожидание запуска сервера....2025-06-13 13:55:32.504 MSK [96998] @ [] СООБЩЕНИЕ:  передача вывода в протокол процессу сбора протоколов
-2025-06-13 13:55:32.504 MSK [96998] @ [] ПОДСКАЗКА:  В дальнейшем протоколы будут выводиться в каталог "log".
- готово
-сервер запущен
-[postgres0@pg120 ~]$ pg_basebackup -D $HOME/pitr_base_backup -Ft -Xs -P --wal-method=stream -p 9523
-31689/31689 КБ (100%), табличное пространство 4/4
-[postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser
-psql (16.4)
-Введите "help", чтобы получить справку.
+    chat_id |      chat_name       |          created_at           
+    ---------+----------------------+-------------------------------
+        1 | обсуждение проекта x | 2025-09-08 03:02:38.715542+03
+        2 | разговоры о погоде   | 2025-09-08 03:02:38.715542+03
+    (2 строки)
 
-loudblackuser=# INSERT INTO users (username) VALUES ('user_to_be_restored');
-INSERT 0 1
-loudblackuser=# INSERT INTO chats (chat_name) VALUES ('chat_to_restore');
-INSERT 0 1
-loudblackuser=# SELECT now();
-              now              
--------------------------------
- 2025-06-13 13:56:16.901815+03
-(1 строка)
+    chat_id | user_id |           joined_at           
+    ---------+---------+-------------------------------
+        1 |       1 | 2025-09-08 03:02:43.266589+03
+        1 |       2 | 2025-09-08 03:02:43.266589+03
+        2 |       3 | 2025-09-08 03:02:46.799593+03
+        2 |       1 | 2025-09-08 03:02:50.796875+03
+    (4 строки)
 
-loudblackuser=# DROP TABLE messages;
-DROP TABLE
-loudblackuser=# DROP TABLE chat_participants;
-DROP TABLE
-loudblackuser=# \q
-[postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser -c "SELECT pg_switch_wal();"
- pg_switch_wal 
----------------
- 0/3018AF8
-(1 строка)
+    message_id | chat_id | user_id |                   content                   |            sent_at            
+    ------------+---------+---------+---------------------------------------------+-------------------------------
+            1 |       1 |       1 | привет, боб! как дела с задачей?            | 2025-09-08 03:02:55.427453+03
+            2 |       1 |       2 | привет, элис! почти готово, остались тесты. | 2025-09-08 03:02:55.427453+03
+            3 |       2 |       3 | сегодня отличный день!                      | 2025-09-08 03:03:00.753523+03
+            4 |       2 |       1 | да, солнечно, но ветрено.                   | 2025-09-08 03:03:00.753523+03
+    (4 строки)
 
-[postgres0@pg120 ~]$ ssh postgres4@pg112 'ls -l /var/db/postgres4/wal_archive'
-total 4795
--rw-------  1 postgres4 postgres 16777216 13 июня  13:55 000000010000000000000001
--rw-------  1 postgres4 postgres 16777216 13 июня  13:55 000000010000000000000002
--rw-------  1 postgres4 postgres      338 13 июня  13:55 000000010000000000000002.00000028.backup
--rw-------  1 postgres4 postgres 16777216 13 июня  13:56 000000010000000000000003
--rw-------  1 postgres4 postgres 16777216 13 июня  13:48 000000010000000000000004
-[postgres0@pg120 ~]$ pg_ctl -D $HOME/onb52 stop -m smart
-ожидание завершения работы сервера.... готово
-сервер остановлен
-[postgres0@pg120 ~]$ mv $HOME/onb52 $HOME/onb52_crashed
-[postgres0@pg120 ~]$ mkdir $HOME/onb52
-[postgres0@pg120 ~]$ chmod 700 $HOME/onb52
-[postgres0@pg120 ~]$ tar -xf $HOME/pitr_base_backup/base.tar -C $HOME/onb52
-[postgres0@pg120 ~]$ tar -xf $HOME/pitr_base_backup/pg_wal.tar -C $HOME/onb52/pg_wal
-[postgres0@pg120 ~]$ touch $HOME/onb52/recovery.signal
-[postgres0@pg120 ~]$ cat >> $HOME/onb52/postgresql.conf <<EOF
-> restore_command = 'scp postgres4@pg112:/var/db/postgres4/wal_archive/%f %p'
-recovery_target_time = '2025-06-13 15:56:21.414515+03'
-recovery_target_action = 'promote'
-EOF
-[postgres0@pg120 ~]$ pg_ctl -D $HOME/onb52 start
-ожидание запуска сервера....2025-06-13 13:58:01.203 MSK [97401] @ [] СООБЩЕНИЕ:  передача вывода в протокол процессу сбора протоколов
-2025-06-13 13:58:01.203 MSK [97401] @ [] ПОДСКАЗКА:  В дальнейшем протоколы будут выводиться в каталог "log".
-. готово
-сервер запущен
-[postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser -c "\dt"
-                   Список отношений
- Схема  |        Имя        |   Тип   |   Владелец    
---------+-------------------+---------+---------------
- public | chat_participants | таблица | chat_app_user
- public | chats             | таблица | chat_app_user
- public | messages          | таблица | chat_app_user
- public | users             | таблица | chat_app_user
-(4 строки)
+    loudblackuser=# INSERT INTO users (username) VALUES ('user_to_be_restored_1');
+    INSERT 0 1
+    loudblackuser=# INSERT INTO chats (chat_name) VALUES ('chat_to_restore_1');
+    INSERT 0 1
+    loudblackuser=# SELECT now();
+                now              
+    -------------------------------
+    2025-09-08 04:15:08.978111+03
+    (1 строка)
 
-[postgres0@pg120 ~]$
-```
+    loudblackuser=# DROP TABLE messages;
+    DROP TABLE
+    loudblackuser=# DROP TABLE chat_participants;
+    DROP TABLE
+    loudblackuser=# exit
+    [postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser -c "SELECT pg_switch_wal();"
+    pg_switch_wal 
+    ---------------
+    0/19010060
+    (1 строка)
+
+    [postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser -c "SELECT pg_switch_wal();"
+    pg_switch_wal 
+    ---------------
+    0/1A000000
+    (1 строка)
+
+    [postgres0@pg120 ~]$ pg_ctl -D $HOME/onb52 stop -m smart
+    ожидание завершения работы сервера...... готово
+    сервер остановлен
+    [postgres0@pg120 ~]$ mv $HOME/onb52 $HOME/onb52_crashed
+    [postgres0@pg120 ~]$ mkdir $HOME/onb52
+    [postgres0@pg120 ~]$ chmod 700 $HOME/onb52
+    [postgres0@pg120 ~]$ tar -xf $HOME/pitr_base_backup/base.tar -C $HOME/onb52
+    [postgres0@pg120 ~]$ while read oid path; do
+            ln -s "$path" "$HOME/onb52/pg_tblspc/$oid"
+        done < "$HOME/onb52/tablespace_map"
+    [postgres0@pg120 ~]$ for l in "$HOME/onb52/pg_tblspc"/*; do
+            if [ -L "$l" ]; then  # Проверяем, что это символическая ссылка
+                oid=$(basename "$l")
+                dest=$(readlink -f "$l")
+                tf="$HOME/pitr_base_backup/$oid.tar"
+                
+                if [ -f "$tf" ]; then
+                    echo "Restoring tablespace $oid into $dest"
+                    # Очищаем и создаём директорию
+                    rm -rf "$dest"
+                    mkdir -p "$dest"
+                    # Извлекаем архив
+                    tar -xf "$tf" -C "$dest"
+                    # Устанавливаем правильные права
+                    chmod 700 "$dest"
+                fi
+            fi
+        done
+    Restoring tablespace 16388 into /var/db/postgres0/syi73
+    Restoring tablespace 16389 into /var/db/postgres0/poe29
+    Restoring tablespace 16390 into /var/db/postgres0/pgdata_custom_ts
+    [postgres0@pg120 ~]$ touch $HOME/onb52/recovery.signal
+    [postgres0@pg120 ~]$ cat >> $HOME/onb52/postgresql.conf <<EOF
+    restore_command = 'scp postgres4@pg112:/var/db/postgres4/wal_archive/%f %p'
+    recovery_target_time = '2025-09-08 04:15:08.978111+03'
+    recovery_target_action = 'promote'
+    EOF
+    [postgres0@pg120 ~]$ pg_ctl -D $HOME/onb52 start
+    ожидание запуска сервера....2025-09-08 04:16:30.101 MSK [12658] @ [] СООБЩЕНИЕ:  передача вывода в протокол процессу сбора протоколов
+    2025-09-08 04:16:30.101 MSK [12658] @ [] ПОДСКАЗКА:  В дальнейшем протоколы будут выводиться в каталог "log".
+    ... готово
+    сервер запущен
+    [postgres0@pg120 ~]$ psql -p 9523 -U postgres0 -d loudblackuser
+    psql (16.4)
+    Введите "help", чтобы получить справку.
+
+    loudblackuser=#     select * from users;
+        select * from chats;
+        select * from chat_participants;
+        select * from messages;
+    user_id |       username        |          created_at           
+    ---------+-----------------------+-------------------------------
+        1 | alice                 | 2025-09-08 03:02:35.336203+03
+        2 | bob                   | 2025-09-08 03:02:35.336203+03
+        3 | charlie               | 2025-09-08 03:02:35.336203+03
+        4 | user_to_be_restored_1 | 2025-09-08 04:15:02.086888+03
+    (4 строки)
+
+    chat_id |      chat_name       |          created_at           
+    ---------+----------------------+-------------------------------
+        1 | обсуждение проекта x | 2025-09-08 03:02:38.715542+03
+        2 | разговоры о погоде   | 2025-09-08 03:02:38.715542+03
+        3 | chat_to_restore_1    | 2025-09-08 04:15:06.006339+03
+    (3 строки)
+
+    chat_id | user_id |           joined_at           
+    ---------+---------+-------------------------------
+        1 |       1 | 2025-09-08 03:02:43.266589+03
+        1 |       2 | 2025-09-08 03:02:43.266589+03
+        2 |       3 | 2025-09-08 03:02:46.799593+03
+        2 |       1 | 2025-09-08 03:02:50.796875+03
+    (4 строки)
+
+    message_id | chat_id | user_id |                   content                   |            sent_at            
+    ------------+---------+---------+---------------------------------------------+-------------------------------
+            1 |       1 |       1 | привет, боб! как дела с задачей?            | 2025-09-08 03:02:55.427453+03
+            2 |       1 |       2 | привет, элис! почти готово, остались тесты. | 2025-09-08 03:02:55.427453+03
+            3 |       2 |       3 | сегодня отличный день!                      | 2025-09-08 03:03:00.753523+03
+            4 |       2 |       1 | да, солнечно, но ветрено.                   | 2025-09-08 03:03:00.753523+03
+    (4 строки)
+
+    loudblackuser=# exit
+    ```

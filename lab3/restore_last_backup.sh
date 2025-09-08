@@ -1,10 +1,7 @@
 # ~/restore_last_backup.sh
 
-#!/bin/bash
+set -e
 
-set -e # Прерывать выполнение при любой ошибке
-
-# --- Переменные ---
 BACKUP_ROOT_DIR="/var/db/postgres4/cold_backups"
 CLUSTER_COMPONENTS=("onb52" "nwx49" "syi73" "poe29" "pgdata_custom_ts")
 PGDATA_DIR_NAME="onb52"
@@ -14,9 +11,7 @@ LOG_FILE="$HOME/postgres_restore.log"
 echo "--- Starting restoration process ---"
 
 # 0. Остановка существующего сервера
-# Проверяем, существует ли каталог данных. Если нет, то и сервера точно нет.
 if [ -d "$PGDATA_PATH" ]; then
-    # Проверяем статус сервера. `pg_ctl status` возвращает 0, если работает, и не 0, если нет.
     if pg_ctl -D "$PGDATA_PATH" status > /dev/null 2>&1; then
         echo "PostgreSQL server is running. Stopping it first..."
         pg_ctl -D "$PGDATA_PATH" stop -m fast
@@ -29,7 +24,6 @@ else
 fi
 
 # 1. Находим последнюю резервную копию
-# Получаем список бэкапов, сортируем по имени в обратном порядке (новые сначала)
 backup_list=()
 while IFS= read -r -d $'\0' dir; do
     backup_list+=("$dir")
@@ -81,15 +75,41 @@ for oid in "${!TBLSPC_LINKS[@]}"; do
 done
 echo "All links have been corrected."
 
-# 5. Запуск сервера PostgreSQL
+mkdir -p "$PGDATA_PATH/log"
+chmod 700 "$PGDATA_PATH/log"
+
+if [ -f "$PGDATA_PATH/postgresql.conf.copy" ]; then
+    cat "$PGDATA_PATH/postgresql.conf.copy" > "$PGDATA_PATH/postgresql.conf"
+else
+    echo "WARN: postgresql.conf.copy not found; using existing postgresql.conf"
+fi
+
 echo "Starting PostgreSQL server..."
-# Поставим откорректированный postgresql.conf (в нем нет настроек для копирования вала, которые нужны только на основном сервере)
-cat "$PGDATA_PATH/postgresql.conf.copy" > "$PGDATA_PATH/postgresql.conf"
-pg_ctl -D "$PGDATA_PATH" -l "$LOG_FILE" start
 
-sleep 5 # Даем серверу время на запуск
-
-# 6. Проверка статуса
+set +e
+pg_ctl -D "$PGDATA_PATH" -l "$LOG_FILE" start -o "-c logging_collector=off -c log_destination=stderr"
+sleep 5
 pg_ctl -D "$PGDATA_PATH" status
+start_rc=$?
+set -e
+
+# 5. Запуск сервера PostgreSQL
+
+if [ $start_rc -ne 0 ]; then
+    echo "WARN: Initial start failed. Attempting pg_resetwal -f and retrying..."
+    pg_resetwal -f "$PGDATA_PATH"
+
+    set +e
+    pg_ctl -D "$PGDATA_PATH" -l "$LOG_FILE" start -o "-c logging_collector=off -c log_destination=stderr"
+    sleep 5
+    pg_ctl -D "$PGDATA_PATH" status
+    retry_rc=$?
+    set -e
+
+    if [ $retry_rc -ne 0 ]; then
+        echo "ERROR: PostgreSQL failed to start even after pg_resetwal. See $LOG_FILE for details."
+        exit 1
+    fi
+fi
 
 echo "--- Restoration process finished successfully ---"
