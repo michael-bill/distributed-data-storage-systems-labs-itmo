@@ -223,7 +223,6 @@ drwx------   3 postgres4 postgres  3 18 мая   14:37 syi73
 
     set -e
 
-    # --- Переменные ---
     BACKUP_ROOT_DIR="/var/db/postgres4/cold_backups"
     CLUSTER_COMPONENTS=("onb52" "nwx49" "syi73" "poe29" "pgdata_custom_ts")
     PGDATA_DIR_NAME="onb52"
@@ -233,9 +232,7 @@ drwx------   3 postgres4 postgres  3 18 мая   14:37 syi73
     echo "--- Starting restoration process ---"
 
     # 0. Остановка существующего сервера
-    # Проверяем, существует ли каталог данных. Если нет, то и сервера точно нет.
     if [ -d "$PGDATA_PATH" ]; then
-        # Проверяем статус сервера. `pg_ctl status` возвращает 0, если работает, и не 0, если нет.
         if pg_ctl -D "$PGDATA_PATH" status > /dev/null 2>&1; then
             echo "PostgreSQL server is running. Stopping it first..."
             pg_ctl -D "$PGDATA_PATH" stop -m fast
@@ -248,7 +245,6 @@ drwx------   3 postgres4 postgres  3 18 мая   14:37 syi73
     fi
 
     # 1. Находим последнюю резервную копию
-    # Получаем список бэкапов, сортируем по имени в обратном порядке (новые сначала)
     backup_list=()
     while IFS= read -r -d $'\0' dir; do
         backup_list+=("$dir")
@@ -300,16 +296,15 @@ drwx------   3 postgres4 postgres  3 18 мая   14:37 syi73
     done
     echo "All links have been corrected."
 
-    # 5. Запуск сервера PostgreSQL
+    mkdir -p "$PGDATA_PATH/log"
+    chmod 700 "$PGDATA_PATH/log"
+
     echo "Starting PostgreSQL server..."
-    pg_ctl -D "$PGDATA_PATH" -l "$LOG_FILE" start
 
-    sleep 5 # Даем серверу время на запуск
-
-    # 6. Проверка статуса
+    set +e
+    pg_ctl -D "$PGDATA_PATH" -l "$LOG_FILE" start -o "-c logging_collector=off -c log_destination=stderr"
+    sleep 5
     pg_ctl -D "$PGDATA_PATH" status
-
-    echo "--- Restoration process finished successfully ---"
     ```
 3.  Даем скрипту права на выполнение и запускаем его.
 
@@ -602,19 +597,15 @@ loudblackuser=# \q
 
     ```bash
     [postgres0@pg120 ~]$ for l in "$HOME/onb52/pg_tblspc"/*; do
-        if [ -L "$l" ]; then  # Проверяем, что это символическая ссылка
+        if [ -L "$l" ]; then
             oid=$(basename "$l")
             dest=$(readlink -f "$l")
             tf="$HOME/pitr_base_backup/$oid.tar"
-            
             if [ -f "$tf" ]; then
                 echo "Restoring tablespace $oid into $dest"
-                # Очищаем и создаём директорию
                 rm -rf "$dest"
                 mkdir -p "$dest"
-                # Извлекаем архив
                 tar -xf "$tf" -C "$dest"
-                # Устанавливаем правильные права
                 chmod 700 "$dest"
             fi
         fi
@@ -626,7 +617,7 @@ loudblackuser=# \q
     [postgres0@pg120 ~]$ touch $HOME/onb52/recovery.signal
     [postgres0@pg120 ~]$ cat >> $HOME/onb52/postgresql.conf <<EOF
 restore_command = 'scp postgres4@pg112:/var/db/postgres4/wal_archive/%f %p'
-recovery_target_time = '2025-09-08 04:15:08.978111+03'
+recovery_target_time = '2025-09-08 17:58:01.828397+03'
 recovery_target_action = 'promote'
 EOF
     ```

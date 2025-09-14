@@ -90,26 +90,3 @@ set +e
 pg_ctl -D "$PGDATA_PATH" -l "$LOG_FILE" start -o "-c logging_collector=off -c log_destination=stderr"
 sleep 5
 pg_ctl -D "$PGDATA_PATH" status
-start_rc=$?
-set -e
-
-# 5. Запуск сервера PostgreSQL
-
-if [ $start_rc -ne 0 ]; then
-    echo "WARN: Initial start failed. Attempting pg_resetwal -f and retrying..."
-    pg_resetwal -f "$PGDATA_PATH"
-
-    set +e
-    pg_ctl -D "$PGDATA_PATH" -l "$LOG_FILE" start -o "-c logging_collector=off -c log_destination=stderr"
-    sleep 5
-    pg_ctl -D "$PGDATA_PATH" status
-    retry_rc=$?
-    set -e
-
-    if [ $retry_rc -ne 0 ]; then
-        echo "ERROR: PostgreSQL failed to start even after pg_resetwal. See $LOG_FILE for details."
-        exit 1
-    fi
-fi
-
-echo "--- Restoration process finished successfully ---"
