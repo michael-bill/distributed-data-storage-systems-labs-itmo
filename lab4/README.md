@@ -131,8 +131,8 @@ sudo tee /etc/postgresql/17/main/pg_hba.conf > /dev/null << 'EOF'
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
 local   all             all                                     peer
 host    all             all             127.0.0.1/32            scram-sha-256
-host    all             all             192.168.56.0/24         md5
-host    replication     replicator      192.168.56.0/24         md5
+host    all             all             0.0.0.0/0               md5
+host    replication     replicator      0.0.0.0/0               md5
 EOF
 
 # Перезапуск PostgreSQL
@@ -142,9 +142,7 @@ sudo systemctl status postgresql
 
 #### Блок 4: Создание тестовых данных
 
-```bash
-# Создание структуры БД и наполнение данными
-PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+```sql
 -- Создание таблиц
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
@@ -162,12 +160,12 @@ CREATE TABLE orders (
 );
 
 -- Наполнение данными
-INSERT INTO users (name, email) VALUES 
+insert into users (name, email) values 
     ('alice', 'alice@example.com'),
     ('bob', 'bob@example.com'),
     ('charlie', 'charlie@example.com');
 
-INSERT INTO orders (user_id, product, amount) VALUES 
+insert into orders (user_id, product, amount) values 
     (1, 'laptop', 1200.00),
     (2, 'mouse', 25.50),
     (3, 'keyboard', 75.00);
@@ -191,7 +189,7 @@ exit
 
 # Остановка PostgreSQL и очистка данных
 sudo systemctl stop postgresql
-sudo rm -rf /var/lib/postgresql/17/main/*
+sudo rm -rf /var/lib/postgresql/17/main
 ```
 
 #### Блок 6: Создание базового бэкапа
@@ -214,8 +212,10 @@ sudo tee /etc/postgresql/17/main/pg_hba.conf > /dev/null << 'EOF'
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
 local   all             all                                     peer
 host    all             all             127.0.0.1/32            scram-sha-256
-host    all             all             192.168.56.0/24         md5
+host    all             all             0.0.0.0/0               md5
 EOF
+
++ listen_addresses = '*' в postgresql.conf
 
 # Запуск Standby
 sudo systemctl start postgresql
@@ -226,53 +226,33 @@ sudo systemctl status postgresql
 
 #### Блок 7: Проверка на Master
 
-```bash
-# Проверка статуса репликации на Master (VM1)
-PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
--- Статус репликации
-SELECT application_name, state, sync_state FROM pg_stat_replication;
-
+```sql
+-- Статус репликации на Master (VM1)
+select application_name, state, sync_state fro pg_stat_replication;
 -- Тест записи
-INSERT INTO users (name, email) VALUES ('test_user', 'test@example.com');
-SELECT * FROM users WHERE name = 'test_user';
+insert into users (name, email) values ('test_user', 'test@example.com');
 EOF
 ```
 
 #### Блок 8: Проверка на Standby
 
-```bash
-# Проверка на Standby (VM2)
-PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+```sql
+-- Проверка на Standby (VM2)
+
 -- Проверка режима Standby
-SELECT pg_is_in_recovery();
+select pg_is_in_recovery();
 
 -- Проверка данных (включая новые)
-SELECT * FROM users WHERE name = 'test_user';
+select * from users where name = 'test_user';
 
 -- Попытка записи (должна быть ошибка)
-INSERT INTO users (name, email) VALUES ('should_fail', 'fail@example.com');
+insert into users (name, email) values ('should_fail', 'fail@example.com');
 EOF
 ```
 
 #### Блок 9: Проверка с клиента (MacOS)
 
-```bash
-# Установка клиента (если не установлен)
-brew install postgresql
-
-# Тест подключения к Master
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "
-SELECT 'MASTER: ' || current_database() AS connection_test;
-SELECT COUNT(*) AS total_users FROM users;
-"
-
-# Тест подключения к Standby
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "
-SELECT 'STANDBY: ' || current_database() AS connection_test;
-SELECT COUNT(*) AS total_users FROM users;
-SELECT 'Is Standby: ' || pg_is_in_recovery() AS standby_status;
-"
-```
+Аналогично
 
 ---
 
@@ -282,39 +262,7 @@ SELECT 'Is Standby: ' || pg_is_in_recovery() AS standby_status;
 
 #### Блок 10: Несколько клиентских подключений
 
-```bash
-# Терминал 1 - Подключение к Master для записи
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb << 'EOF'
--- Добавление данных перед сбоем
-INSERT INTO users (name, email) VALUES ('before_crash', 'before@crash.com');
-INSERT INTO orders (user_id, product, amount) VALUES (1, 'before_crash_product', 999.99);
-
--- Начинаем транзакцию (не завершаем)
-BEGIN;
-INSERT INTO users (name, email) VALUES ('in_transaction', 'transaction@example.com');
--- НЕ КОММИТИМ - оставляем транзакцию висящей
-SELECT txid_current() AS transaction_id;
-EOF
-```
-
-```bash
-# Терминал 2 - Проверка данных на Master
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "
-SELECT 'MASTER DATA BEFORE CRASH:' AS status;
-SELECT * FROM users ORDER BY id DESC LIMIT 5;
-SELECT * FROM orders ORDER BY id DESC LIMIT 3;
-"
-```
-
-```bash
-# Терминал 3 - Проверка данных на Standby
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "
-SELECT 'STANDBY DATA BEFORE CRASH:' AS status;
-SELECT * FROM users ORDER BY id DESC LIMIT 5;
-SELECT * FROM orders ORDER BY id DESC LIMIT 3;
-SELECT 'Standby Status: ' || pg_is_in_recovery() AS standby_check;
-"
-```
+Аналогично
 
 ### 2.2 Сбой - симуляция программной ошибки
 
@@ -323,10 +271,11 @@ SELECT 'Standby Status: ' || pg_is_in_recovery() AS standby_check;
 ```bash
 # На VM1 - убиваем все процессы PostgreSQL
 sudo pkill -9 postgres
+```
 
-# Проверка, что процессы убиты
-ps aux | grep postgres
-sudo systemctl status postgresql
+```sql
+-- На VM1 в терминальной сессии проверяем стаутс (соединение должно быть разорвано)
+select 1;
 ```
 
 ### 2.3 Обработка сбоя
@@ -335,10 +284,10 @@ sudo systemctl status postgresql
 
 ```bash
 # На VM2 - проверка логов Standby
-sudo tail -20 /var/log/postgresql/postgresql-17-main.log
+sudo cat /var/log/postgresql/postgresql-17-main.log
 
 # На VM1 - проверка логов Master (после сбоя)
-sudo tail -20 /var/log/postgresql/postgresql-17-main.log
+sudo cat /var/log/postgresql/postgresql-17-main.log
 ```
 
 #### Блок 13: Ручное переключение (failover) на Standby
@@ -369,44 +318,28 @@ sudo systemctl restart postgresql
 
 #### Блок 14: Проверка нового Master
 
-```bash
-# Проверка статуса нового Master (VM2)
-PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+```sql
+-- Проверка статуса нового Master (VM2)
 -- Проверка статуса
-SELECT 'NEW MASTER STATUS: ' || NOT pg_is_in_recovery() AS is_master;
+select pg_is_in_recovery();
 
 -- Проверка данных
-SELECT * FROM users ORDER BY id DESC LIMIT 5;
+select * from users by id decs;
+select * from orders by id decs;
 
 -- Тест записи в новый Master
-INSERT INTO users (name, email) VALUES ('after_failover', 'after@failover.com');
-INSERT INTO orders (user_id, product, amount) VALUES (2, 'failover_product', 777.77);
+insert into users (name, email) values ('after_failover', 'after@failover.com');
+insert into orders (user_id, product, amount) values (2, 'failover_product', 777.77);
 
--- Демонстрация транзакции на новом Master
-BEGIN;
-INSERT INTO users (name, email) VALUES ('transaction_on_new_master', 'new_master@transaction.com');
-UPDATE orders SET amount = amount * 1.1 WHERE user_id = 1;
-COMMIT;
-
-SELECT 'AFTER FAILOVER:' AS status;
-SELECT * FROM users ORDER BY id DESC LIMIT 3;
-SELECT * FROM orders ORDER BY id DESC LIMIT 3;
-EOF
+select * from users by id decs;
+select * from orders by id decs;
 ```
 
 #### Блок 15: Проверка с клиента
 
-```bash
-# Подключение к новому Master с клиента (MacOS)
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "
-SELECT 'CLIENT CONNECTION TO NEW MASTER:' AS status;
-SELECT COUNT(*) AS total_users FROM users;
-SELECT COUNT(*) AS total_orders FROM orders;
-
--- Клиентская транзакция
-INSERT INTO users (name, email) VALUES ('client_user', 'client@example.com');
-SELECT 'Client can write to new Master: OK' AS test_result;
-"
+```sql
+select * from users by id decs;
+select * from orders by id decs;
 ```
 
 ---
@@ -416,12 +349,9 @@ SELECT 'Client can write to new Master: OK' AS test_result;
 ### Блок 16: Восстановление основного узла (VM1)
 
 ```bash
-# На VM1 - запуск PostgreSQL
-sudo systemctl start postgresql
-
 # Если не запускается из-за повреждений, очищаем данные
 sudo systemctl stop postgresql
-sudo rm -rf /var/lib/postgresql/17/main/*
+sudo rm -rf /var/lib/postgresql/17/main
 
 # Создание базового бэкапа с нового Master (VM2)
 sudo -u postgres bash -c "
@@ -442,21 +372,10 @@ sudo systemctl status postgresql
 
 ### Блок 17: Проверка актуализации данных
 
-```bash
-# На VM1 - проверка, что данные синхронизированы
-PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
--- Проверка статуса (должен быть Standby)
-SELECT 'VM1 STATUS: ' || pg_is_in_recovery() AS is_standby;
-
--- Проверка ВСЕХ данных (включая записанные во время сбоя)
-SELECT 'RESTORED DATA ON VM1:' AS status;
-SELECT * FROM users ORDER BY id;
-SELECT * FROM orders ORDER BY id;
-
--- Должны увидеть:
--- 1. Данные до сбоя (before_crash)
--- 2. Данные после failover (after_failover, transaction_on_new_master, client_user)
-EOF
+```sql
+-- psql на VM1
+select * from users by id decs;
+select * from orders by id decs;
 ```
 
 ### Блок 18: Возврат к исходной конфигурации
@@ -490,7 +409,7 @@ sudo systemctl restart postgresql
 ```bash
 # На VM2 - остановка и очистка
 sudo systemctl stop postgresql
-sudo rm -rf /var/lib/postgresql/17/main/*
+sudo rm -rf /var/lib/postgresql/17/main
 
 # Создание базового бэкапа с восстановленного Master (VM1)
 sudo -u postgres bash -c "
@@ -519,66 +438,26 @@ sudo systemctl status postgresql
 
 ### Блок 20: Финальная проверка восстановления
 
-```bash
-# Проверка Master (VM1)
-PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+```sql
+-- Проверка Master (VM1)
 -- Проверка статуса Master
-SELECT 'VM1 FINAL STATUS: ' || NOT pg_is_in_recovery() AS is_master;
+select pg_is_in_recovery();
 
 -- Проверка репликации
-SELECT application_name, state, sync_state FROM pg_stat_replication;
+select application_name, state, sync_state FROM pg_stat_replication;
 
 -- Финальный тест записи
-INSERT INTO users (name, email) VALUES ('final_test', 'final@test.com');
-SELECT 'FINAL MASTER DATA:' AS status;
-SELECT * FROM users ORDER BY id DESC LIMIT 5;
-EOF
+insert into users (name, email) values ('final_test', 'final@test.com');
+select * from users by id decs;
 ```
 
-```bash
-# Проверка Standby (VM2)
-PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+```sql
 -- Проверка статуса Standby
-SELECT 'VM2 FINAL STATUS: ' || pg_is_in_recovery() AS is_standby;
+select pg_is_in_recovery();
 
 -- Проверка синхронизации финального теста
-SELECT * FROM users WHERE name = 'final_test';
+select * from users by id decs;
 
 -- Попытка записи (должна быть ошибка)
-INSERT INTO users (name, email) VALUES ('should_fail_again', 'fail@again.com');
-EOF
+insert into users (name, email) values ('should_fail_again', 'fail@again.com');
 ```
-
-```bash
-# Финальная проверка с клиента (MacOS)
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "
-SELECT 'FINAL CLIENT TEST - MASTER:' AS status;
-SELECT COUNT(*) AS total_users FROM users;
-INSERT INTO users (name, email) VALUES ('client_final', 'client_final@test.com');
-"
-
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "
-SELECT 'FINAL CLIENT TEST - STANDBY:' AS status;
-SELECT COUNT(*) AS total_users FROM users;
-SELECT * FROM users WHERE name = 'client_final';
-"
-```
-
----
-
-## Заключение
-
-В результате выполнения лабораторной работы была успешно продемонстрирована отказоустойчивая система PostgreSQL:
-
-1. ✅ **Настроена репликация Master + Hot Standby** между двумя виртуальными машинами
-2. ✅ **Продемонстрирован сценарий failover** с ручным переключением ролей
-3. ✅ **Показано сохранение данных** - все данные, записанные во время сбоя, сохранены
-4. ✅ **Выполнено восстановление** исходной конфигурации VM1=Master, VM2=Standby
-5. ✅ **Подтверждена работоспособность** системы после восстановления
-
-### Ключевые моменты:
-
-- **Время простоя системы**: минимальное - только время выполнения команды promote
-- **Потеря данных**: отсутствует - все транзакции сохранены
-- **Клиентские подключения**: могут быть переключены на новый Master без потери функциональности
-- **Репликация**: работает в обоих направлениях при смене ролей
