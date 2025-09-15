@@ -18,8 +18,6 @@
 
 **Цель работы** - ознакомиться с методами и средствами построения отказоустойчивых решений на базе СУБД PostgreSQL, получить практические навыки восстановления работы системы после отказа.
 
-Работа рассчитана на двух человек и выполняется в три этапа: настройка, симуляция и обработка сбоя, восстановление.
-
 ### Требования к выполнению работы
 
 - В качестве хостов использовать одинаковые виртуальные машины.
@@ -52,265 +50,154 @@
 - Восстанавить исправную работу узлов в исходной конфигурации (в соответствии с этапом 1).
 - Продемонстрировать состояние данных и работу клиентов в режиме чтения/записи.
 
-### Вопросы для подготовки к защите
-
-- Синхронная и асинхронная репликация: отличия, ограничения и область применения.
-- Кластер в режиме Active-Active и Active-Standby: отличия, ограничения и область применения.
-- Балансировка нагрузки: описание и область применения.
-- От чего зависит время простоя системы в случае отказа?
-
 ---
 
 ## Ход выполнения работы
 
-### Архитектура и окружение
+### Архитектура
 
-- **VM1** (192.168.56.2) - Master (Ubuntu, пользователь: main)
-- **VM2** (192.168.56.3) - Hot Standby (Ubuntu, пользователь: main)
-- **Client** - MacOS хост-машина для подключения к БД
-- **PostgreSQL версия**: 17
-- **Пароли**: 123qwe123qwe (для всех пользователей)
-
-### Подготовка виртуальных машин
-
-#### На обеих VM (VM1 и VM2):
-
-```bash
-# Обновление системы
-sudo apt update && sudo apt upgrade -y
-
-# Установка SSH сервера
-sudo apt install openssh-server -y
-sudo systemctl enable ssh
-sudo systemctl start ssh
-
-# Проверка IP адреса
-ip a
-
-# Установка PostgreSQL 17
-sudo apt install postgresql postgresql-contrib -y
-
-# Проверка версии
-sudo -u postgres psql -c "select version();"
-```
-
-#### Настройка SSH без пароля между VM
-
-На VM1:
-```bash
-# Генерация SSH ключей
-ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa
-
-# Копирование ключа на VM2
-ssh-copy-id main@192.168.56.3
-```
-
-На VM2:
-```bash
-# Генерация SSH ключей
-ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa
-
-# Копирование ключа на VM1
-ssh-copy-id main@192.168.56.2
-```
-
-Проверка:
-```bash
-# С VM1 на VM2
-ssh main@192.168.56.3 'echo "SSH connection successful"'
-
-# С VM2 на VM1
-ssh main@192.168.56.2 'echo "SSH connection successful"'
-```
+- **VM1** (192.168.56.2) - Master (Ubuntu)
+- **VM2** (192.168.56.3) - Hot Standby (Ubuntu)
+- **Client** - MacOS хост-машина
+- **PostgreSQL**: версия 17
+- **Пароль БД**: 123qwe123qwe
 
 ---
 
 ## Этап 1. Конфигурация Master + Hot Standby
 
-### Настройка Master (VM1 - 192.168.56.2)
+### Подготовка окружения
 
-#### 1. Создание пользователя main1 с супер правами
+#### Установка PostgreSQL на обеих VM:
 
 ```bash
-# Переключение на пользователя postgres
+# Обновление и установка PostgreSQL (выполнить на VM1 и VM2)
+sudo apt update && sudo apt install postgresql postgresql-contrib -y
+sudo systemctl enable postgresql
+sudo systemctl start postgresql
+
+# Проверка версии
+sudo -u postgres psql -c "select version();"
+
+# Проверка IP (должно показать 192.168.56.2 или 192.168.56.3)
+ip a | grep 192.168.56
+```
+
+### Настройка Master (VM1)
+
+#### Блок 1: Создание пользователей и базы данных
+
+```bash
+# Переключение на пользователя postgres и настройка
 sudo -i -u postgres
-
-# Создание пользователя main1
 createuser --superuser main1
-
-# Установка пароля
 psql -c "alter user main1 password '123qwe123qwe';"
-
-# Создание базы данных для main1
-createdb -O main1 main1
-
-# Выход из пользователя postgres
+createuser --replication replicator
+psql -c "alter user replicator password '123qwe123qwe';"
+createdb -O main1 testdb
 exit
+
+# Проверка подключения
+PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb -c "select current_user;"
 ```
 
-#### 2. Настройка postgresql.conf
+#### Блок 2: Конфигурация postgresql.conf
 
 ```bash
-# Редактирование конфигурации
-sudo vim /etc/postgresql/17/main/postgresql.conf
-```
+# Создание архивной директории
+sudo -u postgres mkdir -p /var/lib/postgresql/17/archive
 
-Найти и изменить/добавить следующие параметры:
-```conf
-# Основные параметры
+# Добавление параметров репликации в postgresql.conf
+sudo tee -a /etc/postgresql/17/main/postgresql.conf > /dev/null << 'EOF'
+
+# Master configuration
 listen_addresses = '*'
-port = 5432
-
-# Параметры репликации
 wal_level = replica
 max_wal_senders = 3
 max_replication_slots = 3
 wal_keep_size = 256MB
 hot_standby = on
-wal_log_hints = on
-
-# Архивирование WAL
 archive_mode = on
 archive_command = 'test ! -f /var/lib/postgresql/17/archive/%f && cp %p /var/lib/postgresql/17/archive/%f'
-
-# Логирование
-log_connections = on
-log_disconnections = on
 log_replication_commands = on
-logging_collector = on
-log_directory = 'log'
-log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
+EOF
 ```
 
-#### 3. Создание директории для архивов
+#### Блок 3: Конфигурация pg_hba.conf
 
 ```bash
-sudo -u postgres mkdir -p /var/lib/postgresql/17/archive
-sudo chown postgres:postgres /var/lib/postgresql/17/archive
-```
-
-#### 4. Настройка pg_hba.conf
-
-```bash
-sudo vim /etc/postgresql/17/main/pg_hba.conf
-```
-
-Заменить содержимое на:
-```conf
+# Настройка доступа для репликации
+sudo tee /etc/postgresql/17/main/pg_hba.conf > /dev/null << 'EOF'
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
-# Локальные подключения
 local   all             all                                     peer
-
-# IPv4 подключения
 host    all             all             127.0.0.1/32            scram-sha-256
 host    all             all             192.168.56.0/24         md5
-
-# Репликация
-host    replication     replicator      192.168.56.3/32         md5
 host    replication     replicator      192.168.56.0/24         md5
-```
+EOF
 
-#### 5. Перезапуск PostgreSQL и создание пользователей
-
-```bash
-# Перезапуск службы
+# Перезапуск PostgreSQL
 sudo systemctl restart postgresql
-
-# Проверка статуса
 sudo systemctl status postgresql
-
-# Создание пользователя для репликации
-psql -U main1 -d main1 -h 127.0.0.1
 ```
 
-```sql
--- Создание пользователя репликации
-create user replicator with replication encrypted password '123qwe123qwe';
-
--- Создание тестовой базы данных
-create database testdb;
-grant all privileges on database testdb to main1;
-
--- Проверка
-\du
-\l
-\q
-```
-
-#### 6. Создание тестовых таблиц и данных
+#### Блок 4: Создание тестовых данных
 
 ```bash
-psql -U main1 -d testdb -h 127.0.0.1
-```
-
-```sql
+# Создание структуры БД и наполнение данными
+PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
 -- Создание таблиц
-create table users (
-    id serial primary key,
-    name varchar(100) not null,
-    email varchar(100) unique,
-    created_at timestamp default current_timestamp
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-create table orders (
-    id serial primary key,
-    user_id int references users(id),
-    product varchar(200),
-    amount decimal(10,2),
-    order_date timestamp default current_timestamp
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES users(id),
+    product VARCHAR(200),
+    amount DECIMAL(10,2),
+    order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Наполнение данными
-insert into users (name, email) values 
+INSERT INTO users (name, email) VALUES 
     ('alice', 'alice@example.com'),
     ('bob', 'bob@example.com'),
     ('charlie', 'charlie@example.com');
 
-insert into orders (user_id, product, amount) values 
+INSERT INTO orders (user_id, product, amount) VALUES 
     (1, 'laptop', 1200.00),
     (2, 'mouse', 25.50),
-    (3, 'keyboard', 75.00),
-    (1, 'monitor', 300.00);
+    (3, 'keyboard', 75.00);
 
 -- Проверка
-select * from users;
-select * from orders;
-\q
+SELECT * FROM users;
+SELECT * FROM orders;
+EOF
 ```
 
-### Настройка Standby (VM2 - 192.168.56.3)
+### Настройка Standby (VM2)
 
-#### 1. Создание пользователя main1
+#### Блок 5: Подготовка Standby
 
 ```bash
 # Создание пользователя main1
 sudo -i -u postgres
 createuser --superuser main1
 psql -c "alter user main1 password '123qwe123qwe';"
-createdb -O main1 main1
 exit
-```
 
-#### 2. Остановка PostgreSQL и очистка данных
-
-```bash
-# Остановка службы
+# Остановка PostgreSQL и очистка данных
 sudo systemctl stop postgresql
-
-# Сохранение конфигурации
-sudo cp /etc/postgresql/17/main/postgresql.conf /tmp/postgresql.conf.backup
-sudo cp /etc/postgresql/17/main/pg_hba.conf /tmp/pg_hba.conf.backup
-
-# Очистка данных
-sudo -i
-rm -rf /var/lib/postgresql/17/main/*
-exit
+sudo rm -rf /var/lib/postgresql/17/main/*
 ```
 
-#### 3. Создание базового бэкапа с Master
+#### Блок 6: Создание базового бэкапа
 
 ```bash
-# Выполнение базового бэкапа с автоматическим вводом пароля
+# Создание базового бэкапа с Master
 sudo -u postgres bash -c "
 export PGPASSWORD='123qwe123qwe'
 pg_basebackup \
@@ -321,413 +208,71 @@ pg_basebackup \
   -X stream \
   -R
 "
-```
 
-#### 4. Настройка конфигурации на Standby
-
-```bash
-# Восстановление postgresql.conf
-sudo cp /tmp/postgresql.conf.backup /etc/postgresql/17/main/postgresql.conf
-
-# Редактирование для Standby
-sudo vim /etc/postgresql/17/main/postgresql.conf
-```
-
-Убедиться, что есть:
-```conf
-listen_addresses = '*'
-port = 5432
-hot_standby = on
-```
-
-#### 5. Настройка pg_hba.conf на Standby
-
-```bash
-sudo vim /etc/postgresql/17/main/pg_hba.conf
-```
-
-```conf
+# Настройка pg_hba.conf для Standby
+sudo tee /etc/postgresql/17/main/pg_hba.conf > /dev/null << 'EOF'
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
 local   all             all                                     peer
 host    all             all             127.0.0.1/32            scram-sha-256
 host    all             all             192.168.56.0/24         md5
-```
+EOF
 
-#### 6. Проверка автоматически созданных файлов
-
-```bash
-# Проверка наличия standby.signal
-ls -la /var/lib/postgresql/17/main/standby.signal
-
-# Проверка postgresql.auto.conf
-cat /var/lib/postgresql/17/main/postgresql.auto.conf
-```
-
-#### 7. Запуск Standby
-
-```bash
-# Запуск PostgreSQL
+# Запуск Standby
 sudo systemctl start postgresql
-
-# Проверка статуса
 sudo systemctl status postgresql
-
-# Проверка логов
-sudo tail -f /var/log/postgresql/postgresql-17-main.log
 ```
 
 ### Проверка репликации
 
-#### На Master (VM1):
+#### Блок 7: Проверка на Master
 
 ```bash
-psql -U main1 -d main1 -h 127.0.0.1
+# Проверка статуса репликации на Master (VM1)
+PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+-- Статус репликации
+SELECT application_name, state, sync_state FROM pg_stat_replication;
+
+-- Тест записи
+INSERT INTO users (name, email) VALUES ('test_user', 'test@example.com');
+SELECT * FROM users WHERE name = 'test_user';
+EOF
 ```
 
-```sql
--- Проверка состояния репликации
-select * from pg_stat_replication;
-
--- Текущая позиция WAL
-select pg_current_wal_lsn();
-\q
-```
-
-#### На Standby (VM2):
+#### Блок 8: Проверка на Standby
 
 ```bash
-psql -U main1 -d testdb -h 127.0.0.1
+# Проверка на Standby (VM2)
+PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+-- Проверка режима Standby
+SELECT pg_is_in_recovery();
+
+-- Проверка данных (включая новые)
+SELECT * FROM users WHERE name = 'test_user';
+
+-- Попытка записи (должна быть ошибка)
+INSERT INTO users (name, email) VALUES ('should_fail', 'fail@example.com');
+EOF
 ```
 
-```sql
--- Проверка режима recovery
-select pg_is_in_recovery();  -- должно вернуть 't' (true)
-
--- Проверка данных
-select * from users;
-select * from orders;
-
--- Попытка записи (должна выдать ошибку)
-insert into users (name, email) values ('test', 'test@test.com');
-\q
-```
-
-#### С клиентской машины (MacOS):
+#### Блок 9: Проверка с клиента (MacOS)
 
 ```bash
-# Подключение к Master (чтение/запись)
-psql -h 192.168.56.2 -U main1 -d testdb
-# Пароль: 123qwe123qwe
+# Установка клиента (если не установлен)
+brew install postgresql
+
+# Тест подключения к Master
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "
+SELECT 'MASTER: ' || current_database() AS connection_test;
+SELECT COUNT(*) AS total_users FROM users;
+"
+
+# Тест подключения к Standby
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "
+SELECT 'STANDBY: ' || current_database() AS connection_test;
+SELECT COUNT(*) AS total_users FROM users;
+SELECT 'Is Standby: ' || pg_is_in_recovery() AS standby_status;
+"
 ```
-
-```sql
--- Проверка чтения
-select * from users;
-
--- Проверка записи
-insert into users (name, email) values ('david', 'david@example.com');
-select * from users;
-\q
-```
-
-```bash
-# Подключение к Standby (только чтение)
-psql -h 192.168.56.3 -U main1 -d testdb
-```
-
-```sql
--- Проверка синхронизации данных
-select * from users where name = 'david';
-
--- Попытка записи (ошибка)
-insert into users (name, email) values ('eve', 'eve@example.com');
-\q
-```
-
----
-
-## Создание скриптов автоматического переключения
-
-### Скрипт мониторинга и автоматического failover на VM2
-
-Создаем скрипт `/home/main/auto_failover.sh` на VM2:
-
-```bash
-vim /home/main/auto_failover.sh
-```
-
-```bash
-#!/bin/bash
-
-# Конфигурация
-MASTER_HOST="192.168.56.2"  # VM1 - всегда должен быть Master
-STANDBY_HOST="192.168.56.3" # VM2 - всегда должен быть Standby (мы)
-DB_USER="main1"
-DB_NAME="testdb"
-PGDATA="/var/lib/postgresql/17/main"
-LOG_FILE="/home/main/failover.log"
-LOCK_FILE="/tmp/failover.lock"
-
-# Проверка блокировки для предотвращения одновременных запусков
-if [ -f "$LOCK_FILE" ]; then
-    if kill -0 $(cat "$LOCK_FILE") 2>/dev/null; then
-        exit 0  # Предыдущий процесс еще работает
-    else
-        rm -f "$LOCK_FILE"  # Удаляем устаревший lock файл
-    fi
-fi
-
-# Создаем lock файл
-echo $$ > "$LOCK_FILE"
-
-# Функция очистки при выходе
-cleanup() {
-    rm -f "$LOCK_FILE"
-}
-trap cleanup EXIT
-
-# Функция логирования
-log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> $LOG_FILE
-}
-
-# Проверка доступности Master (VM1)
-check_master() {
-    for i in {1..3}; do
-        if timeout 3 bash -c "export PGPASSWORD='123qwe123qwe'; psql -h $MASTER_HOST -U $DB_USER -d $DB_NAME -c 'select 1;'" > /dev/null 2>&1; then
-            return 0  # Master доступен
-        fi
-        sleep 2
-    done
-    return 1  # Master недоступен
-}
-
-# Проверка, является ли текущий узел Master
-is_master() {
-    for i in {1..5}; do
-        result=$(timeout 3 bash -c "export PGPASSWORD='123qwe123qwe'; psql -h 127.0.0.1 -U $DB_USER -d $DB_NAME -t -c 'select pg_is_in_recovery();'" 2>/dev/null | tr -d ' ')
-        if [ "$result" = "f" ]; then
-            return 0  # Это Master
-        elif [ "$result" = "t" ]; then
-            return 1  # Это Standby
-        fi
-        sleep 1
-    done
-    return 1  # Не удалось определить статус
-}
-
-# Проверка, запущен ли PostgreSQL на VM1
-check_master_postgres_running() {
-    ssh main@$MASTER_HOST "timeout 5 bash -c \"export PGPASSWORD='123qwe123qwe'; psql -h 127.0.0.1 -U $DB_USER -d $DB_NAME -c 'select 1;'\"" > /dev/null 2>&1
-    return $?
-}
-
-# Промоушн в Master
-promote_to_master() {
-    log_message "Promoting VM2 to Master..."
-    
-    if is_master; then
-        log_message "Already in Master mode, no promotion needed"
-        return 0
-    fi
-    
-    promote_output=$(sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl promote -D $PGDATA 2>&1)
-    promote_exit_code=$?
-    
-    log_message "Promote command output: $promote_output"
-    log_message "Promote exit code: $promote_exit_code"
-    
-    if [ $promote_exit_code -ne 0 ]; then
-        if echo "$promote_output" | grep -q "server is not in standby mode"; then
-            log_message "Server is already promoted, checking status..."
-            if is_master; then
-                log_message "Confirmed: already in Master mode"
-                return 0
-            fi
-        fi
-        log_message "Promote command failed with exit code $promote_exit_code"
-        return 1
-    fi
-    
-    sleep 3
-    
-    for i in {1..10}; do
-        log_message "Checking master status, attempt $i/10"
-        if is_master; then
-            log_message "Successfully promoted VM2 to Master"
-            return 0
-        fi
-        sleep 1
-    done
-    
-    log_message "Failed to promote to Master or unable to verify status"
-    return 1
-}
-
-# Восстановление VM1 как Master и переключение VM2 в Standby
-restore_master_standby_setup() {
-    log_message "Restoring original Master-Standby setup (VM1=Master, VM2=Standby)..."
-    
-    # Шаг 1: Остановить PostgreSQL на VM1 если он запущен
-    log_message "Step 1: Stopping PostgreSQL on VM1 if running..."
-    ssh main@$MASTER_HOST 'sudo systemctl stop postgresql' 2>/dev/null
-    
-    # Шаг 2: Очистить данные на VM1 и создать базовый бэкап с VM2
-    log_message "Step 2: Creating base backup on VM1 from VM2..."
-    ssh main@$MASTER_HOST "
-        sudo rm -rf /var/lib/postgresql/17/main
-        sudo -u postgres bash -c '
-            export PGPASSWORD=\"123qwe123qwe\"
-            pg_basebackup \
-                -h $STANDBY_HOST \
-                -D /var/lib/postgresql/17/main \
-                -U replicator \
-                -v -P \
-                -X stream \
-                -R
-        '
-    " > /dev/null 2>&1
-    
-    backup_result=$?
-    log_message "VM1 base backup result: $backup_result"
-    
-    if [ $backup_result -ne 0 ]; then
-        log_message "Failed to create base backup on VM1"
-        return 1
-    fi
-    
-    # Шаг 3: Запустить PostgreSQL на VM1 как Standby
-    log_message "Step 3: Starting PostgreSQL on VM1 as Standby..."
-    ssh main@$MASTER_HOST 'sudo systemctl start postgresql'
-    sleep 5
-    
-    # Шаг 4: Проверить, что VM1 запустился как Standby
-    log_message "Step 4: Verifying VM1 is running as Standby..."
-    vm1_is_standby=$(timeout 5 bash -c "export PGPASSWORD='123qwe123qwe'; psql -h $MASTER_HOST -U $DB_USER -d $DB_NAME -t -c 'select pg_is_in_recovery();'" 2>/dev/null | tr -d ' ')
-    
-    if [ "$vm1_is_standby" != "t" ]; then
-        log_message "VM1 is not in Standby mode, aborting failback"
-        return 1
-    fi
-    
-    log_message "VM1 is now running as Standby"
-    
-    # Шаг 5: Промоутить VM1 в Master
-    log_message "Step 5: Promoting VM1 to Master..."
-    ssh main@$MASTER_HOST 'sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl promote -D /var/lib/postgresql/17/main' > /dev/null 2>&1
-    sleep 5
-    
-    # Шаг 6: Проверить, что VM1 стал Master
-    log_message "Step 6: Verifying VM1 is now Master..."
-    vm1_is_master=$(timeout 5 bash -c "export PGPASSWORD='123qwe123qwe'; psql -h $MASTER_HOST -U $DB_USER -d $DB_NAME -t -c 'select pg_is_in_recovery();'" 2>/dev/null | tr -d ' ')
-    
-    if [ "$vm1_is_master" != "f" ]; then
-        log_message "VM1 failed to become Master, aborting failback"
-        return 1
-    fi
-    
-    log_message "VM1 is now Master"
-    
-    # Шаг 7: Переключить VM2 в Standby
-    log_message "Step 7: Switching VM2 back to Standby..."
-    sudo systemctl stop postgresql
-    sudo rm -rf /var/lib/postgresql/17/main
-    
-    # Создать базовый бэкап с нового Master (VM1)
-    sudo -u postgres bash -c "
-        export PGPASSWORD='123qwe123qwe'
-        pg_basebackup \
-            -h $MASTER_HOST \
-            -D $PGDATA \
-            -U replicator \
-            -v -P \
-            -X stream \
-            -R
-    " > /dev/null 2>&1
-    
-    backup_result=$?
-    log_message "VM2 base backup result: $backup_result"
-    
-    if [ $backup_result -eq 0 ]; then
-        sudo systemctl start postgresql
-        sleep 5
-        
-        if ! is_master; then
-            log_message "Successfully restored Master-Standby setup: VM1=Master, VM2=Standby"
-            return 0
-        else
-            log_message "VM2 failed to become Standby"
-        fi
-    else
-        log_message "Failed to create base backup on VM2"
-    fi
-    
-    log_message "Failed to restore Master-Standby setup"
-    return 1
-}
-
-# Основная логика
-main() {
-    log_message "=== Starting intelligent failover management ==="
-    
-    # Проверяем статус VM1 (должен быть Master)
-    log_message "Checking VM1 PostgreSQL status..."
-    if check_master_postgres_running; then
-        log_message "VM1 PostgreSQL is running"
-        
-        # Проверяем наш статус
-        if is_master; then
-            log_message "We (VM2) are Master - VM1 is back but we need to restore proper setup"
-            restore_master_standby_setup
-        else
-            log_message "We (VM2) are Standby - normal operation, VM1 is Master"
-        fi
-    else
-        log_message "VM1 PostgreSQL is not running"
-        
-        # Проверяем, доступен ли VM1 для подключения к базе
-        if check_master; then
-            log_message "VM1 is accessible but something is wrong with PostgreSQL"
-        else
-            log_message "VM1 is completely down"
-            
-            # Проверяем наш статус
-            if is_master; then
-                log_message "We (VM2) are already Master - waiting for VM1 recovery"
-            else
-                log_message "We (VM2) are Standby but Master is down - promoting to Master"
-                promote_to_master
-            fi
-        fi
-    fi
-    
-    log_message "=== Failover management completed ==="
-}
-
-# Запуск основной логики
-main
-```
-
-Делаем скрипт исполняемым:
-```bash
-chmod +x /home/main/auto_failover.sh
-```
-
-### Настройка cron для автоматического мониторинга
-
-```bash
-# Редактирование crontab
-crontab -e
-```
-
-Добавить строку:
-```
-*/2 * * * * /home/main/auto_failover.sh
-```
-
-### Настройка cron только на VM2
-
-**Важно**: Теперь используется только один скрипт на VM2, который управляет всем процессом через SSH.
 
 ---
 
@@ -735,540 +280,305 @@ crontab -e
 
 ### 2.1 Подготовка - демонстрация работы
 
-#### Открыть несколько терминалов на MacOS:
+#### Блок 10: Несколько клиентских подключений
 
-**Терминал 1 - Мониторинг Master:**
 ```bash
-# Подключение к Master
-psql -h 192.168.56.2 -U main1 -d testdb
-```
-
-```sql
+# Терминал 1 - Подключение к Master для записи
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb << 'EOF'
 -- Добавление данных перед сбоем
-insert into users (name, email) values ('before_crash', 'before@crash.com');
-insert into orders (user_id, product, amount) values (1, 'before_crash_product', 999.99);
+INSERT INTO users (name, email) VALUES ('before_crash', 'before@crash.com');
+INSERT INTO orders (user_id, product, amount) VALUES (1, 'before_crash_product', 999.99);
 
--- Проверка данных
-select 'MASTER DATA:' as source;
-select * from users order by id desc limit 3;
-select * from orders order by id desc limit 3;
-\q
+-- Начинаем транзакцию (не завершаем)
+BEGIN;
+INSERT INTO users (name, email) VALUES ('in_transaction', 'transaction@example.com');
+-- НЕ КОММИТИМ - оставляем транзакцию висящей
+SELECT txid_current() AS transaction_id;
+EOF
 ```
 
-**Терминал 2 - Мониторинг Standby:**
 ```bash
-# Подключение к Standby
-psql -h 192.168.56.3 -U main1 -d testdb
+# Терминал 2 - Проверка данных на Master
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "
+SELECT 'MASTER DATA BEFORE CRASH:' AS status;
+SELECT * FROM users ORDER BY id DESC LIMIT 5;
+SELECT * FROM orders ORDER BY id DESC LIMIT 3;
+"
 ```
 
-```sql
--- Проверка синхронизации
-select 'STANDBY DATA:' as source;
-select * from users order by id desc limit 3;
-select * from orders order by id desc limit 3;
-
--- Проверка статуса
-select 'STANDBY STATUS:' as info, pg_is_in_recovery() as is_standby;
-\q
-```
-
-**Терминал 3 - Непрерывный мониторинг:**
 ```bash
-# Мониторинг доступности Master
-while true; do
-    echo "=== $(date) ==="
-    echo "Master status:"
-    psql -h 192.168.56.2 -U main1 -d testdb -c "select 'Master is UP', count(*) from users;" 2>/dev/null || echo "Master is DOWN"
-    
-    echo "Standby status:"
-    psql -h 192.168.56.3 -U main1 -d testdb -c "select 'Standby mode:', pg_is_in_recovery();" 2>/dev/null || echo "Standby is DOWN"
-    
-    echo "---"
-    sleep 5
-done
+# Терминал 3 - Проверка данных на Standby
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "
+SELECT 'STANDBY DATA BEFORE CRASH:' AS status;
+SELECT * FROM users ORDER BY id DESC LIMIT 5;
+SELECT * FROM orders ORDER BY id DESC LIMIT 3;
+SELECT 'Standby Status: ' || pg_is_in_recovery() AS standby_check;
+"
 ```
 
 ### 2.2 Сбой - симуляция программной ошибки
 
-На VM1 (Master):
+#### Блок 11: Симуляция сбоя на Master (VM1)
+
 ```bash
-# Симуляция программной ошибки
+# На VM1 - убиваем все процессы PostgreSQL
 sudo pkill -9 postgres
-```
 
-### 2.3 Обработка - автоматическое переключение
-
-#### Наблюдение за логами на VM2:
-
-```bash
-# Просмотр логов автоматического переключения
-tail -f /home/main/failover.log
-
-# Просмотр логов PostgreSQL
-sudo tail -f /var/log/postgresql/postgresql-17-main.log
-```
-
-#### Ожидание автоматического переключения (до 1 минуты)
-
-Скрипт автоматически обнаружит недоступность Master и выполнит promote.
-
-#### Проверка нового статуса на VM2:
-
-```bash
-psql -U main1 -d testdb -h 127.0.0.1
-```
-
-```sql
--- Проверка, что больше не в recovery режиме
-select pg_is_in_recovery();  -- должно вернуть 'f' (false)
-
--- Проверка, что можем писать
-insert into users (name, email) values ('after_failover', 'after@failover.com');
-insert into orders (user_id, product, amount) values (2, 'failover_product', 777.77);
-
-select * from users order by id desc limit 5;
-select * from orders order by id desc limit 5;
-\q
-```
-
-#### Проверка с клиента (MacOS):
-
-```bash
-# Теперь подключаемся к VM2 для записи
-psql -h 192.168.56.3 -U main1 -d testdb
-```
-
-```sql
--- Проверка записи на новый Master
-insert into users (name, email) values ('new_master_test', 'newmaster@test.com');
-select * from users order by id desc limit 5;
-
--- Демонстрация транзакций
-begin;
-insert into users (name, email) values ('transaction_test', 'transaction@test.com');
-insert into orders (user_id, product, amount) values (3, 'transaction_product', 555.55);
-commit;
-
-select * from users order by id desc limit 3;
-select * from orders order by id desc limit 3;
-\q
-```
-
----
-
-## Этап 3. Восстановление
-
-### 3.1 Восстановление старого Master (VM1)
-
-На VM1:
-```bash
-# Запуск PostgreSQL (попытка)
-sudo systemctl start postgresql
-
-# Проверка статуса
+# Проверка, что процессы убиты
+ps aux | grep postgres
 sudo systemctl status postgresql
-
-# Если запустился, остановка для корректной настройки
-sudo systemctl stop postgresql
 ```
 
-#### Автоматическое переключение обратно
+### 2.3 Обработка сбоя
 
-Скрипт на VM2 автоматически обнаружит, что оригинальный Master снова доступен, и переключится обратно в режим Standby.
-
-#### Наблюдение за процессом:
-
-На VM2:
-```bash
-# Просмотр логов переключения
-tail -f /home/main/failover.log
-```
-
-На VM1:
-```bash
-# Просмотр логов мониторинга
-tail -f /home/main/master_monitor.log
-```
-
-### 3.2 Проверка восстановления исходной конфигурации
-
-#### На Master (VM1):
+#### Блок 12: Проверка логов
 
 ```bash
-# Ожидание завершения автоматического процесса
-sleep 60
-
-# Проверка статуса
-psql -U main1 -d testdb -h 127.0.0.1
-```
-
-```sql
--- Проверка статуса Master
-select pg_is_in_recovery();  -- должно быть false
-
--- Проверка данных (должны быть все данные, включая добавленные во время сбоя)
-select * from users order by id;
-select * from orders order by id;
-
--- Проверка репликации
-select * from pg_stat_replication;
-\q
-```
-
-#### На Standby (VM2):
-
-```bash
-psql -U main1 -d testdb -h 127.0.0.1
-```
-
-```sql
--- Проверка статуса Standby
-select pg_is_in_recovery();  -- должно быть true
-
--- Проверка синхронизации данных
-select * from users order by id;
-select * from orders order by id;
-
--- Попытка записи (должна быть ошибка)
-insert into users (name, email) values ('test_after_restore', 'test@restore.com');
-\q
-```
-
-### 3.3 Полная демонстрация сценария failover/failback
-
-#### Исходное состояние: VM1=Master, VM2=Standby
-
-#### Шаг 1: Запись данных в Master и проверка репликации
-
-```bash
-# Подключение к Master (VM1)
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb
-```
-
-```sql
--- Запись данных ПЕРЕД сбоем
-insert into users (name, email) values ('before_crash', 'before@crash.com');
-insert into orders (user_id, product, amount) values (1, 'before_crash_product', 999.99);
-
--- Проверка данных на Master
-select 'VM1 MASTER BEFORE CRASH:' as info;
-select * from users order by id desc limit 3;
-select * from orders order by id desc limit 3;
-\q
-```
-
-```bash
-# Проверка репликации на Standby (VM2)
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb
-```
-
-```sql
--- Проверка синхронизации ПЕРЕД сбоем
-select 'VM2 STANDBY BEFORE CRASH:' as info;
-select * from users order by id desc limit 3;
-select * from orders order by id desc limit 3;
-\q
-```
-
-#### Шаг 2: Симуляция сбоя Master (VM1)
-
-На VM1:
-```bash
-# Убиваем Master
-sudo pkill -9 postgres
-```
-
-#### Шаг 3: Ожидание автоматического failover (1-2 минуты)
-
-```bash
-# Мониторинг логов на VM2 - скрипт автоматически промоутит VM2 в Master
-tail -f /home/main/failover.log
-```
-
-Ожидаемые логи:
-```
-VM1 PostgreSQL is not running
-VM1 is completely down
-We (VM2) are Standby but Master is down - promoting to Master
-Successfully promoted VM2 to Master
-```
-
-#### Шаг 4: Запись данных в новый Master (VM2) - КЛЮЧЕВОЙ МОМЕНТ!
-
-```bash
-# Подключение к новому Master (VM2)
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb
-```
-
-```sql
--- Запись данных ПОСЛЕ failover (пока VM1 лежит)
-insert into users (name, email) values ('during_failover', 'during@failover.com');
-insert into orders (user_id, product, amount) values (2, 'failover_product', 777.77);
-
--- Проверка данных на новом Master
-select 'VM2 NEW MASTER AFTER FAILOVER:' as info;
-select * from users order by id desc limit 5;
-select * from orders order by id desc limit 5;
-\q
-```
-
-#### Шаг 5: Восстановление VM1
-
-На VM1:
-```bash
-# Запускаем PostgreSQL
-sudo systemctl start postgresql
-```
-
-#### Шаг 6: Ожидание автоматического failback (2-3 минуты)
-
-```bash
-# Мониторинг логов на VM2 - скрипт автоматически выполнит failback
-tail -f /home/main/failover.log
-```
-
-Ожидаемые логи:
-```
-VM1 PostgreSQL is running
-We (VM2) are Master - VM1 is back but we need to restore proper setup
-Restoring original Master-Standby setup (VM1=Master, VM2=Standby)
-Step 1: Stopping PostgreSQL on VM1 if running...
-Step 2: Creating base backup on VM1 from VM2...
-Step 3: Starting PostgreSQL on VM1 as Standby...
-Step 4: Verifying VM1 is running as Standby...
-Step 5: Promoting VM1 to Master...
-Step 6: Verifying VM1 is now Master...
-Step 7: Switching VM2 back to Standby...
-Successfully restored Master-Standby setup: VM1=Master, VM2=Standby
-```
-
-#### Шаг 7: Проверка данных на восстановленном Master (VM1)
-
-```bash
-# Проверка данных на восстановленном Master (VM1)
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb
-```
-
-```sql
--- Проверка ВСЕХ данных (включая записанные во время сбоя)
-select 'VM1 RESTORED MASTER DATA:' as info;
-select * from users order by id;
-select * from orders order by id;
-
--- Должны увидеть:
--- 1. Данные до сбоя (before_crash)
--- 2. Данные во время сбоя (during_failover) ← КЛЮЧЕВОЙ МОМЕНТ!
-
--- Проверка статуса (должен быть Master)
-select 'VM1 STATUS:' as info, case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as role;
-\q
-```
-
-#### Шаг 8: Проверка Standby (VM2)
-
-```bash
-# Проверка Standby (VM2)
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb
-```
-
-```sql
--- Проверка синхронизации данных
-select 'VM2 STANDBY DATA:' as info;
-select * from users order by id;
-select * from orders order by id;
-
--- Проверка статуса (должен быть Standby)
-select 'VM2 STATUS:' as info, case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as role;
-
--- Попытка записи (должна быть ошибка)
-insert into users (name, email) values ('should_fail', 'should@fail.com');
-\q
-```
-
-#### Шаг 9: Финальная проверка работы системы
-
-```bash
-# Финальная запись на Master (VM1)
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb
-```
-
-```sql
--- Финальная запись для подтверждения работы
-insert into users (name, email) values ('final_test', 'final@test.com');
-select 'FINAL TEST ON MASTER:' as info;
-select * from users where name = 'final_test';
-\q
-```
-
-```bash
-# Проверка синхронизации на Standby (VM2)
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb
-```
-
-```sql
--- Должны увидеть финальную запись
-select 'FINAL SYNC CHECK ON STANDBY:' as info;
-select * from users where name = 'final_test';
-\q
-```
-
-### Ожидаемый результат:
-
-1. ✅ **VM1 снова Master, VM2 снова Standby** - исходная конфигурация восстановлена
-2. ✅ **Данные до сбоя** - сохранены
-3. ✅ **Данные во время сбоя** - переданы на восстановленный VM1 ← **КЛЮЧЕВОЙ МОМЕНТ!**
-4. ✅ **Автоматическое управление** - один скрипт на VM2 управляет всем процессом
-5. ✅ **Полная синхронизация** - VM2 получает все обновления от VM1
-
----
-
-## Устранение проблем
-
-### Проблема: Медленная работа скрипта и конфликты запусков
-
-**Симптомы:**
-```
-2025-09-15 02:42:01 - Checking current node status...
-2025-09-15 02:42:21 - Current node is STANDBY  # 20 секунд на проверку!
-```
-
-И ошибки повторного промоушна:
-```
-2025-09-15 02:45:28 - Promote command output: pg_ctl: cannot promote server; server is not in standby mode
-```
-
-**Причины:**
-1. Функция `is_master()` работает слишком медленно (до 20 секунд)
-2. Новые запуски cron начинаются, пока предыдущие еще работают
-3. Попытки повторного промоушна уже промоутнутого сервера
-
-**Решения в обновленном скрипте:**
-- **Lock-файл** для предотвращения одновременных запусков
-- **Быстрые таймауты**: 3 секунды вместо без ограничений
-- **Меньше попыток**: 5 вместо 10 для проверки статуса
-- **Защита от повторного промоушна**: проверка текущего статуса перед промоушном
-- **Обработка ошибки "not in standby mode"**: автоматическая проверка, что сервер уже Master
-- **Частота cron**: каждые 2 минуты вместо каждой минуты
-
-**Проверка успешности промоушна вручную:**
-```bash
-# На VM2 после сообщения о неудачном промоушне
-PGPASSWORD='123qwe123qwe' psql -U main1 -d testdb -h 127.0.0.1 -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as status;"
-
-# Проверка логов PostgreSQL
+# На VM2 - проверка логов Standby
 sudo tail -20 /var/log/postgresql/postgresql-17-main.log
 
-# Проверка процессов
-ps aux | grep postgres
+# На VM1 - проверка логов Master (после сбоя)
+sudo tail -20 /var/log/postgresql/postgresql-17-main.log
 ```
 
-### Проблема: pg_basebackup запрашивает пароль интерактивно
+#### Блок 13: Ручное переключение (failover) на Standby
 
-**Симптомы:**
 ```bash
-sudo -u postgres pg_basebackup -h 192.168.56.2 -U replicator ...
-Password: # Ждет ввода пароля
+# На VM2 - промоушн в Master
+sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl promote -D /var/lib/postgresql/17/main
+
+# Добавление конфигурации Master для приема репликации
+sudo tee -a /etc/postgresql/17/main/postgresql.conf > /dev/null << 'EOF'
+
+# Master configuration after promotion
+wal_level = replica
+max_wal_senders = 3
+max_replication_slots = 3
+wal_keep_size = 256MB
+archive_mode = on
+archive_command = 'test ! -f /var/lib/postgresql/17/archive/%f && cp %p /var/lib/postgresql/17/archive/%f'
+log_replication_commands = on
+EOF
+
+# Создание директории для архивов
+sudo -u postgres mkdir -p /var/lib/postgresql/17/archive
+
+# Перезапуск для применения конфигурации
+sudo systemctl restart postgresql
 ```
 
-**Причина:**
-`pg_basebackup` не может использовать файл `.pgpass` при запуске через `sudo -u postgres`, и флаг `-W` требует интерактивного ввода.
+#### Блок 14: Проверка нового Master
 
-**Решение:**
-Использовать переменную окружения `PGPASSWORD`:
 ```bash
-sudo -u postgres bash -c "
-export PGPASSWORD='123qwe123qwe'
-pg_basebackup -h 192.168.56.2 -U replicator -D /path/to/data -v -P -X stream -R
+# Проверка статуса нового Master (VM2)
+PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+-- Проверка статуса
+SELECT 'NEW MASTER STATUS: ' || NOT pg_is_in_recovery() AS is_master;
+
+-- Проверка данных
+SELECT * FROM users ORDER BY id DESC LIMIT 5;
+
+-- Тест записи в новый Master
+INSERT INTO users (name, email) VALUES ('after_failover', 'after@failover.com');
+INSERT INTO orders (user_id, product, amount) VALUES (2, 'failover_product', 777.77);
+
+-- Демонстрация транзакции на новом Master
+BEGIN;
+INSERT INTO users (name, email) VALUES ('transaction_on_new_master', 'new_master@transaction.com');
+UPDATE orders SET amount = amount * 1.1 WHERE user_id = 1;
+COMMIT;
+
+SELECT 'AFTER FAILOVER:' AS status;
+SELECT * FROM users ORDER BY id DESC LIMIT 3;
+SELECT * FROM orders ORDER BY id DESC LIMIT 3;
+EOF
+```
+
+#### Блок 15: Проверка с клиента
+
+```bash
+# Подключение к новому Master с клиента (MacOS)
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "
+SELECT 'CLIENT CONNECTION TO NEW MASTER:' AS status;
+SELECT COUNT(*) AS total_users FROM users;
+SELECT COUNT(*) AS total_orders FROM orders;
+
+-- Клиентская транзакция
+INSERT INTO users (name, email) VALUES ('client_user', 'client@example.com');
+SELECT 'Client can write to new Master: OK' AS test_result;
 "
 ```
 
-### Дополнительные команды для диагностики скрипта
-
-```bash
-# Просмотр полных логов failover
-cat /home/main/failover.log
-
-# Запуск скрипта вручную для отладки
-/home/main/auto_failover.sh
-
-# Проверка cron задач
-crontab -l
-sudo systemctl status cron
-
-# Проверка прав на выполнение скрипта
-ls -la /home/main/auto_failover.sh
-
-# Проверка lock-файла
-ls -la /tmp/failover.lock
-
-# Тестирование подключения с паролем
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U replicator -d testdb -c 'select 1;'
-
-# Тестирование подключения как main1
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c 'select 1;'
-```
-
 ---
 
-## Полезные команды для диагностики
+## Восстановление
+
+### Блок 16: Восстановление основного узла (VM1)
 
 ```bash
-# Проверка процессов PostgreSQL
-ps aux | grep postgres
+# На VM1 - запуск PostgreSQL
+sudo systemctl start postgresql
 
-# Статус службы
+# Если не запускается из-за повреждений, очищаем данные
+sudo systemctl stop postgresql
+sudo rm -rf /var/lib/postgresql/17/main/*
+
+# Создание базового бэкапа с нового Master (VM2)
+sudo -u postgres bash -c "
+export PGPASSWORD='123qwe123qwe'
+pg_basebackup \
+  -h 192.168.56.3 \
+  -D /var/lib/postgresql/17/main \
+  -U replicator \
+  -v -P \
+  -X stream \
+  -R
+"
+
+# Запуск как Standby
+sudo systemctl start postgresql
 sudo systemctl status postgresql
-
-# Логи PostgreSQL
-sudo tail -f /var/log/postgresql/postgresql-17-main.log
-
-# Логи автоматического переключения
-tail -f /home/main/failover.log
-
-# Проверка портов
-sudo netstat -tlpn | grep 5432
-
-# Проверка cron задач
-crontab -l
-
-# Проверка SSH соединения
-ssh main@192.168.56.2 'echo "Connection OK"'
-ssh main@192.168.56.3 'echo "Connection OK"'
 ```
 
-### SQL команды для мониторинга:
+### Блок 17: Проверка актуализации данных
 
 ```bash
-# Проверка репликации на Master
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "select application_name, state, sync_state, replay_lsn from pg_stat_replication;"
+# На VM1 - проверка, что данные синхронизированы
+PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+-- Проверка статуса (должен быть Standby)
+SELECT 'VM1 STATUS: ' || pg_is_in_recovery() AS is_standby;
 
-# Проверка задержки репликации на Standby
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "select extract(epoch from (now() - pg_last_xact_replay_timestamp())) as replication_lag;"
+-- Проверка ВСЕХ данных (включая записанные во время сбоя)
+SELECT 'RESTORED DATA ON VM1:' AS status;
+SELECT * FROM users ORDER BY id;
+SELECT * FROM orders ORDER BY id;
 
-# Размер отставания WAL на Master
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "select pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) as replication_lag from pg_stat_replication;"
+-- Должны увидеть:
+-- 1. Данные до сбоя (before_crash)
+-- 2. Данные после failover (after_failover, transaction_on_new_master, client_user)
+EOF
+```
 
-# Текущий статус узла VM1
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as node_status;"
+### Блок 18: Возврат к исходной конфигурации
 
-# Текущий статус узла VM2
-PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as node_status;"
+```bash
+# Промоушн VM1 обратно в Master
+sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl promote -D /var/lib/postgresql/17/main
 
-# Быстрая проверка статуса обеих VM
-echo "=== VM1 Status ===" && PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -t -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end;" 2>/dev/null || echo "VM1 DOWN"
-echo "=== VM2 Status ===" && PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -t -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end;" 2>/dev/null || echo "VM2 DOWN"
+# Добавление конфигурации Master на VM1
+sudo tee -a /etc/postgresql/17/main/postgresql.conf > /dev/null << 'EOF'
+
+# Master configuration for VM1
+wal_level = replica
+max_wal_senders = 3
+max_replication_slots = 3
+wal_keep_size = 256MB
+archive_mode = on
+archive_command = 'test ! -f /var/lib/postgresql/17/archive/%f && cp %p /var/lib/postgresql/17/archive/%f'
+log_replication_commands = on
+EOF
+
+# Создание директории для архивов
+sudo -u postgres mkdir -p /var/lib/postgresql/17/archive
+
+# Перезапуск для применения конфигурации
+sudo systemctl restart postgresql
+```
+
+### Блок 19: Переключение VM2 обратно в Standby
+
+```bash
+# На VM2 - остановка и очистка
+sudo systemctl stop postgresql
+sudo rm -rf /var/lib/postgresql/17/main/*
+
+# Создание базового бэкапа с восстановленного Master (VM1)
+sudo -u postgres bash -c "
+export PGPASSWORD='123qwe123qwe'
+pg_basebackup \
+  -h 192.168.56.2 \
+  -D /var/lib/postgresql/17/main \
+  -U replicator \
+  -v -P \
+  -X stream \
+  -R
+"
+
+# Настройка pg_hba.conf для Standby
+sudo tee /etc/postgresql/17/main/pg_hba.conf > /dev/null << 'EOF'
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             all                                     peer
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             192.168.56.0/24         md5
+EOF
+
+# Запуск как Standby
+sudo systemctl start postgresql
+sudo systemctl status postgresql
+```
+
+### Блок 20: Финальная проверка восстановления
+
+```bash
+# Проверка Master (VM1)
+PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+-- Проверка статуса Master
+SELECT 'VM1 FINAL STATUS: ' || NOT pg_is_in_recovery() AS is_master;
+
+-- Проверка репликации
+SELECT application_name, state, sync_state FROM pg_stat_replication;
+
+-- Финальный тест записи
+INSERT INTO users (name, email) VALUES ('final_test', 'final@test.com');
+SELECT 'FINAL MASTER DATA:' AS status;
+SELECT * FROM users ORDER BY id DESC LIMIT 5;
+EOF
+```
+
+```bash
+# Проверка Standby (VM2)
+PGPASSWORD='123qwe123qwe' psql -U main1 -h 127.0.0.1 -d testdb << 'EOF'
+-- Проверка статуса Standby
+SELECT 'VM2 FINAL STATUS: ' || pg_is_in_recovery() AS is_standby;
+
+-- Проверка синхронизации финального теста
+SELECT * FROM users WHERE name = 'final_test';
+
+-- Попытка записи (должна быть ошибка)
+INSERT INTO users (name, email) VALUES ('should_fail_again', 'fail@again.com');
+EOF
+```
+
+```bash
+# Финальная проверка с клиента (MacOS)
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "
+SELECT 'FINAL CLIENT TEST - MASTER:' AS status;
+SELECT COUNT(*) AS total_users FROM users;
+INSERT INTO users (name, email) VALUES ('client_final', 'client_final@test.com');
+"
+
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "
+SELECT 'FINAL CLIENT TEST - STANDBY:' AS status;
+SELECT COUNT(*) AS total_users FROM users;
+SELECT * FROM users WHERE name = 'client_final';
+"
 ```
 
 ---
 
 ## Заключение
 
-В результате выполнения лабораторной работы была успешно настроена отказоустойчивая система PostgreSQL с автоматическим переключением ролей:
+В результате выполнения лабораторной работы была успешно продемонстрирована отказоустойчивая система PostgreSQL:
 
-1. **Настроена репликация Master + Hot Standby** между двумя виртуальными машинами
-2. **Реализован автоматический failover** с помощью bash скриптов и cron
-3. **Продемонстрирован сценарий отказа и восстановления** с сохранением всех данных
-4. **Обеспечено автоматическое возвращение к исходной конфигурации** при восстановлении основного узла
+1. ✅ **Настроена репликация Master + Hot Standby** между двумя виртуальными машинами
+2. ✅ **Продемонстрирован сценарий failover** с ручным переключением ролей
+3. ✅ **Показано сохранение данных** - все данные, записанные во время сбоя, сохранены
+4. ✅ **Выполнено восстановление** исходной конфигурации VM1=Master, VM2=Standby
+5. ✅ **Подтверждена работоспособность** системы после восстановления
 
-Система способна автоматически переключаться между ролями Master и Standby в течение 1 минуты после обнаружения сбоя, обеспечивая минимальное время простоя и полную сохранность данных.
+### Ключевые моменты:
 
+- **Время простоя системы**: минимальное - только время выполнения команды promote
+- **Потеря данных**: отсутствует - все транзакции сохранены
+- **Клиентские подключения**: могут быть переключены на новый Master без потери функциональности
+- **Репликация**: работает в обоих направлениях при смене ролей
