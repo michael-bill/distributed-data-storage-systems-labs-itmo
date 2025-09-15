@@ -465,6 +465,26 @@ DB_USER="main1"
 DB_NAME="testdb"
 PGDATA="/var/lib/postgresql/17/main"
 LOG_FILE="/home/main/failover.log"
+LOCK_FILE="/tmp/failover.lock"
+
+# Проверка блокировки для предотвращения одновременных запусков
+if [ -f "$LOCK_FILE" ]; then
+    # Проверяем, не завис ли предыдущий процесс
+    if kill -0 $(cat "$LOCK_FILE") 2>/dev/null; then
+        exit 0  # Предыдущий процесс еще работает
+    else
+        rm -f "$LOCK_FILE"  # Удаляем устаревший lock файл
+    fi
+fi
+
+# Создаем lock файл
+echo $$ > "$LOCK_FILE"
+
+# Функция очистки при выходе
+cleanup() {
+    rm -f "$LOCK_FILE"
+}
+trap cleanup EXIT
 
 # Функция логирования
 log_message() {
@@ -473,33 +493,77 @@ log_message() {
 
 # Проверка доступности Master
 check_master() {
-    psql -h $MASTER_HOST -U $DB_USER -d $DB_NAME -c "select 1;" > /dev/null 2>&1
-    return $?
+    # Делаем несколько попыток с таймаутом
+    for i in {1..3}; do
+        if timeout 5 psql -h $MASTER_HOST -U $DB_USER -d $DB_NAME -c "select 1;" > /dev/null 2>&1; then
+            return 0  # Master доступен
+        fi
+        sleep 2
+    done
+    return 1  # Master недоступен
 }
 
 # Проверка, является ли текущий узел Master
 is_master() {
-    result=$(psql -h 127.0.0.1 -U $DB_USER -d $DB_NAME -t -c "select pg_is_in_recovery();" 2>/dev/null | tr -d ' ')
-    if [ "$result" = "f" ]; then
-        return 0  # Это Master
-    else
-        return 1  # Это Standby или недоступен
-    fi
+    # Делаем несколько быстрых попыток подключения
+    for i in {1..5}; do
+        result=$(timeout 3 psql -h 127.0.0.1 -U $DB_USER -d $DB_NAME -t -c "select pg_is_in_recovery();" 2>/dev/null | tr -d ' ')
+        if [ "$result" = "f" ]; then
+            return 0  # Это Master
+        elif [ "$result" = "t" ]; then
+            return 1  # Это Standby
+        fi
+        # Если результат пустой, ждем немного и пробуем снова
+        sleep 1
+    done
+    return 1  # Не удалось определить статус
 }
 
 # Промоушн в Master
 promote_to_master() {
     log_message "Promoting to Master..."
-    sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl promote -D $PGDATA
-    sleep 5
     
+    # Сначала проверяем, не являемся ли мы уже Master
     if is_master; then
-        log_message "Successfully promoted to Master"
+        log_message "Already in Master mode, no promotion needed"
         return 0
-    else
-        log_message "Failed to promote to Master"
+    fi
+    
+    # Выполняем промоушн
+    promote_output=$(sudo -u postgres /usr/lib/postgresql/17/bin/pg_ctl promote -D $PGDATA 2>&1)
+    promote_exit_code=$?
+    
+    log_message "Promote command output: $promote_output"
+    log_message "Promote exit code: $promote_exit_code"
+    
+    # Если команда промоушна вернула ошибку, проверяем причину
+    if [ $promote_exit_code -ne 0 ]; then
+        if echo "$promote_output" | grep -q "server is not in standby mode"; then
+            log_message "Server is already promoted, checking status..."
+            if is_master; then
+                log_message "Confirmed: already in Master mode"
+                return 0
+            fi
+        fi
+        log_message "Promote command failed with exit code $promote_exit_code"
         return 1
     fi
+    
+    # Ждем завершения промоушна
+    sleep 3
+    
+    # Проверяем статус несколько раз с коротким интервалом
+    for i in {1..10}; do
+        log_message "Checking master status, attempt $i/10"
+        if is_master; then
+            log_message "Successfully promoted to Master"
+            return 0
+        fi
+        sleep 1
+    done
+    
+    log_message "Failed to promote to Master or unable to verify status"
+    return 1
 }
 
 # Переключение обратно в Standby
@@ -538,17 +602,24 @@ switch_to_standby() {
 
 # Основная логика
 main() {
+    log_message "=== Starting failover check ==="
+    
     # Проверяем текущее состояние
+    log_message "Checking current node status..."
     if is_master; then
+        log_message "Current node is MASTER"
         # Мы Master, проверяем, доступен ли оригинальный Master
+        log_message "Checking if original Master is back online..."
         if check_master && [ "$MASTER_HOST" != "127.0.0.1" ]; then
             log_message "Original Master is back online, switching to Standby"
             switch_to_standby
         else
-            log_message "We are Master, original Master still down"
+            log_message "We are Master, original Master still down or we are the original Master"
         fi
     else
+        log_message "Current node is STANDBY"
         # Мы Standby, проверяем доступность Master
+        log_message "Checking Master availability..."
         if ! check_master; then
             log_message "Master is down, initiating failover"
             promote_to_master
@@ -556,6 +627,8 @@ main() {
             log_message "Master is available, we remain Standby"
         fi
     fi
+    
+    log_message "=== Failover check completed ==="
 }
 
 # Запуск основной логики
@@ -576,7 +649,7 @@ crontab -e
 
 Добавить строку:
 ```
-* * * * * /home/main/auto_failover.sh
+*/2 * * * * /home/main/auto_failover.sh
 ```
 
 ### Скрипт для VM1 (оригинальный Master)
@@ -640,7 +713,7 @@ crontab -e
 
 Добавить строку:
 ```
-* * * * * /home/main/master_monitor.sh
+*/2 * * * * /home/main/master_monitor.sh
 ```
 
 ---
@@ -708,10 +781,6 @@ done
 ```bash
 # Симуляция программной ошибки
 sudo pkill -9 postgres
-
-# Проверка, что процессы убиты
-ps aux | grep postgres
-sudo systemctl status postgresql
 ```
 
 ### 2.3 Обработка - автоматическое переключение
@@ -887,6 +956,65 @@ select * from orders order by id;
 -- Подтверждение режима Standby
 select 'STANDBY STATUS:' as info, pg_is_in_recovery() as is_standby;
 \q
+```
+
+---
+
+## Устранение проблем
+
+### Проблема: Медленная работа скрипта и конфликты запусков
+
+**Симптомы:**
+```
+2025-09-15 02:42:01 - Checking current node status...
+2025-09-15 02:42:21 - Current node is STANDBY  # 20 секунд на проверку!
+```
+
+И ошибки повторного промоушна:
+```
+2025-09-15 02:45:28 - Promote command output: pg_ctl: cannot promote server; server is not in standby mode
+```
+
+**Причины:**
+1. Функция `is_master()` работает слишком медленно (до 20 секунд)
+2. Новые запуски cron начинаются, пока предыдущие еще работают
+3. Попытки повторного промоушна уже промоутнутого сервера
+
+**Решения в обновленном скрипте:**
+- **Lock-файл** для предотвращения одновременных запусков
+- **Быстрые таймауты**: 3 секунды вместо без ограничений
+- **Меньше попыток**: 5 вместо 10 для проверки статуса
+- **Защита от повторного промоушна**: проверка текущего статуса перед промоушном
+- **Обработка ошибки "not in standby mode"**: автоматическая проверка, что сервер уже Master
+- **Частота cron**: каждые 2 минуты вместо каждой минуты
+
+**Проверка успешности промоушна вручную:**
+```bash
+# На VM2 после сообщения о неудачном промоушне
+psql -U main1 -d testdb -h 127.0.0.1 -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as status;"
+
+# Проверка логов PostgreSQL
+sudo tail -20 /var/log/postgresql/postgresql-17-main.log
+
+# Проверка процессов
+ps aux | grep postgres
+```
+
+### Дополнительные команды для диагностики скрипта
+
+```bash
+# Просмотр полных логов failover
+cat /home/main/failover.log
+
+# Запуск скрипта вручную для отладки
+/home/main/auto_failover.sh
+
+# Проверка cron задач
+crontab -l
+sudo systemctl status cron
+
+# Проверка прав на выполнение скрипта
+ls -la /home/main/auto_failover.sh
 ```
 
 ---
