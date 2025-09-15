@@ -310,16 +310,17 @@ exit
 #### 3. Создание базового бэкапа с Master
 
 ```bash
-# Выполнение базового бэкапа
-sudo -u postgres pg_basebackup \
+# Выполнение базового бэкапа с автоматическим вводом пароля
+sudo -u postgres bash -c "
+export PGPASSWORD='123qwe123qwe'
+pg_basebackup \
   -h 192.168.56.2 \
   -D /var/lib/postgresql/17/main \
   -U replicator \
-  -v -P -W \
+  -v -P \
   -X stream \
   -R
-
-# Пароль: 123qwe123qwe
+"
 ```
 
 #### 4. Настройка конфигурации на Standby
@@ -495,7 +496,7 @@ log_message() {
 check_master() {
     # Делаем несколько попыток с таймаутом
     for i in {1..3}; do
-        if timeout 5 psql -h $MASTER_HOST -U $DB_USER -d $DB_NAME -c "select 1;" > /dev/null 2>&1; then
+        if timeout 3 bash -c "export PGPASSWORD='123qwe123qwe'; psql -h $MASTER_HOST -U $DB_USER -d $DB_NAME -c 'select 1;'" > /dev/null 2>&1; then
             return 0  # Master доступен
         fi
         sleep 2
@@ -507,7 +508,7 @@ check_master() {
 is_master() {
     # Делаем несколько быстрых попыток подключения
     for i in {1..5}; do
-        result=$(timeout 3 psql -h 127.0.0.1 -U $DB_USER -d $DB_NAME -t -c "select pg_is_in_recovery();" 2>/dev/null | tr -d ' ')
+        result=$(timeout 3 bash -c "export PGPASSWORD='123qwe123qwe'; psql -h 127.0.0.1 -U $DB_USER -d $DB_NAME -t -c 'select pg_is_in_recovery();'" 2>/dev/null | tr -d ' ')
         if [ "$result" = "f" ]; then
             return 0  # Это Master
         elif [ "$result" = "t" ]; then
@@ -572,28 +573,40 @@ switch_to_standby() {
     
     # Остановка PostgreSQL
     sudo systemctl stop postgresql
-    
+
     # Очистка данных
-    sudo -i -c "rm -rf /var/lib/postgresql/17/main/*"
+    sudo rm -rf /var/lib/postgresql/17/main
+
+    # Создание нового базового бэкапа с автоматическим вводом пароля
+    log_message "Creating base backup from $MASTER_HOST..."
+    sudo -u postgres bash -c "
+        export PGPASSWORD='123qwe123qwe'
+        pg_basebackup \
+            -h $MASTER_HOST \
+            -D $PGDATA \
+            -U replicator \
+            -v -P \
+            -X stream \
+            -R
+    " > /dev/null 2>&1
     
-    # Создание нового базового бэкапа
-    sudo -u postgres pg_basebackup \
-        -h $MASTER_HOST \
-        -D $PGDATA \
-        -U replicator \
-        -v -P \
-        -X stream \
-        -R > /dev/null 2>&1
+    backup_result=$?
+    log_message "Base backup result: $backup_result"
     
-    if [ $? -eq 0 ]; then
+    if [ $backup_result -eq 0 ]; then
         # Запуск как Standby
+        log_message "Starting PostgreSQL as Standby..."
         sudo systemctl start postgresql
         sleep 5
         
         if ! is_master; then
             log_message "Successfully switched back to Standby"
             return 0
+        else
+            log_message "Started PostgreSQL but still in Master mode"
         fi
+    else
+        log_message "Base backup failed with code $backup_result"
     fi
     
     log_message "Failed to switch back to Standby"
@@ -676,7 +689,7 @@ log_message() {
 
 # Проверка, является ли Standby теперь Master
 check_standby_is_master() {
-    result=$(psql -h $STANDBY_HOST -U $DB_USER -d $DB_NAME -t -c "select pg_is_in_recovery();" 2>/dev/null | tr -d ' ')
+    result=$(bash -c "export PGPASSWORD='123qwe123qwe'; psql -h $STANDBY_HOST -U $DB_USER -d $DB_NAME -t -c 'select pg_is_in_recovery();'" 2>/dev/null | tr -d ' ')
     if [ "$result" = "f" ]; then
         return 0  # Standby стал Master
     else
@@ -991,13 +1004,33 @@ select 'STANDBY STATUS:' as info, pg_is_in_recovery() as is_standby;
 **Проверка успешности промоушна вручную:**
 ```bash
 # На VM2 после сообщения о неудачном промоушне
-psql -U main1 -d testdb -h 127.0.0.1 -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as status;"
+PGPASSWORD='123qwe123qwe' psql -U main1 -d testdb -h 127.0.0.1 -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as status;"
 
 # Проверка логов PostgreSQL
 sudo tail -20 /var/log/postgresql/postgresql-17-main.log
 
 # Проверка процессов
 ps aux | grep postgres
+```
+
+### Проблема: pg_basebackup запрашивает пароль интерактивно
+
+**Симптомы:**
+```bash
+sudo -u postgres pg_basebackup -h 192.168.56.2 -U replicator ...
+Password: # Ждет ввода пароля
+```
+
+**Причина:**
+`pg_basebackup` не может использовать файл `.pgpass` при запуске через `sudo -u postgres`, и флаг `-W` требует интерактивного ввода.
+
+**Решение:**
+Использовать переменную окружения `PGPASSWORD`:
+```bash
+sudo -u postgres bash -c "
+export PGPASSWORD='123qwe123qwe'
+pg_basebackup -h 192.168.56.2 -U replicator -D /path/to/data -v -P -X stream -R
+"
 ```
 
 ### Дополнительные команды для диагностики скрипта
@@ -1015,6 +1048,15 @@ sudo systemctl status cron
 
 # Проверка прав на выполнение скрипта
 ls -la /home/main/auto_failover.sh
+
+# Проверка lock-файла
+ls -la /tmp/failover.lock
+
+# Тестирование подключения с паролем
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U replicator -d testdb -c 'select 1;'
+
+# Тестирование подключения как main1
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c 'select 1;'
 ```
 
 ---
@@ -1047,18 +1089,25 @@ ssh main@192.168.56.3 'echo "Connection OK"'
 
 ### SQL команды для мониторинга:
 
-```sql
--- Проверка репликации на Master
-select application_name, state, sync_state, replay_lsn from pg_stat_replication;
+```bash
+# Проверка репликации на Master
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "select application_name, state, sync_state, replay_lsn from pg_stat_replication;"
 
--- Проверка задержки репликации
-select extract(epoch from (now() - pg_last_xact_replay_timestamp())) as replication_lag;
+# Проверка задержки репликации на Standby
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "select extract(epoch from (now() - pg_last_xact_replay_timestamp())) as replication_lag;"
 
--- Размер отставания WAL
-select pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) as replication_lag from pg_stat_replication;
+# Размер отставания WAL на Master
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "select pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) as replication_lag from pg_stat_replication;"
 
--- Текущий статус узла
-select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as node_status;
+# Текущий статус узла VM1
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as node_status;"
+
+# Текущий статус узла VM2
+PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end as node_status;"
+
+# Быстрая проверка статуса обеих VM
+echo "=== VM1 Status ===" && PGPASSWORD='123qwe123qwe' psql -h 192.168.56.2 -U main1 -d testdb -t -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end;" 2>/dev/null || echo "VM1 DOWN"
+echo "=== VM2 Status ===" && PGPASSWORD='123qwe123qwe' psql -h 192.168.56.3 -U main1 -d testdb -t -c "select case when pg_is_in_recovery() then 'STANDBY' else 'MASTER' end;" 2>/dev/null || echo "VM2 DOWN"
 ```
 
 ---
